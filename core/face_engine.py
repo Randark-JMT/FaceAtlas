@@ -25,6 +25,16 @@ class FaceData:
 
 
 # 关键点颜色 (BGR)
+def imread_unicode(filepath: str) -> np.ndarray | None:
+    """读取 Unicode 路径的图像（解决 Windows 上 cv2.imread 不支持非 ASCII 路径的问题）"""
+    try:
+        buf = np.fromfile(filepath, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        return img
+    except Exception:
+        return None
+
+
 LANDMARK_COLORS = [
     (255, 0, 0),    # 右眼
     (0, 0, 255),    # 左眼

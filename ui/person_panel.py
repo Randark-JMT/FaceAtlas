@@ -10,7 +10,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt, Signal
 
 from core.database import DatabaseManager
-from core.face_engine import FaceEngine
+from core.face_engine import FaceEngine, imread_unicode
 
 
 class PersonGroup(QFrame):
@@ -52,7 +52,7 @@ class PersonGroup(QFrame):
             thumb_label.setToolTip(f"来源: {row['filename']}")
 
             # 加载图像并裁剪人脸
-            img = cv2.imread(row["file_path"])
+            img = imread_unicode(row["file_path"])
             if img is not None:
                 bbox = (row["bbox_x"], row["bbox_y"], row["bbox_w"], row["bbox_h"])
                 crop = FaceEngine.crop_face(img, bbox)

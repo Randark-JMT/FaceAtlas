@@ -1,7 +1,6 @@
 """主窗口 - 组装所有 UI 部件并协调业务逻辑"""
 
 import os
-import cv2
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QMessageBox,
@@ -11,7 +10,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction
 
 from core.database import DatabaseManager
-from core.face_engine import FaceEngine, FaceData
+from core.face_engine import FaceEngine, FaceData, imread_unicode
 from core.face_cluster import FaceCluster
 from ui.image_viewer import ImageViewer
 from ui.face_list_panel import FaceListPanel
@@ -45,7 +44,7 @@ class DetectWorker(QThread):
                 if self.db.image_exists(fpath):
                     continue
 
-                image = cv2.imread(fpath)
+                image = imread_unicode(fpath)
                 if image is None:
                     continue
 
@@ -209,7 +208,7 @@ class MainWindow(QMainWindow):
         if img_row is None:
             return
 
-        cv_img = cv2.imread(img_row["file_path"])
+        cv_img = imread_unicode(img_row["file_path"])
         if cv_img is None:
             self._statusbar.showMessage(f"无法读取图片: {img_row['file_path']}")
             return
