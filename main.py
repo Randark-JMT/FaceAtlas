@@ -90,6 +90,7 @@ def main():
     engine = FaceEngine(DETECTION_MODEL, RECOGNITION_MODEL)
 
     window = MainWindow(engine, db)
+    window.setWindowTitle(f"FaceSeeker - 人脸识别系统  [后端: {engine.backend_name}]")
     window.show()
 
     ret = app.exec()
