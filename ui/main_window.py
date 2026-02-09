@@ -251,7 +251,7 @@ class MainWindow(QMainWindow):
         for row in self.db.get_all_images():
             # 如果有相对路径信息，显示在文件名前面
             display_name = row['filename']
-            if row.get('relative_path') and row['relative_path']:
+            if row['relative_path']:
                 display_name = f"{row['relative_path']}/{row['filename']}"
             item = QListWidgetItem(f"{display_name}  [{row['face_count']} 人脸]")
             item.setData(Qt.ItemDataRole.UserRole, row["id"])
