@@ -1,6 +1,9 @@
 """主窗口 - 组装所有 UI 部件并协调业务逻辑"""
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QMessageBox,
@@ -23,46 +26,78 @@ SUPPORTED_FORMATS = "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff *.webp)"
 # ---- 后台工作线程 ----
 
 class DetectWorker(QThread):
-    """后台人脸检测+特征提取线程"""
+    """后台人脸检测+特征提取线程（多线程并行处理）"""
 
     progress = Signal(int, int, str)  # current, total, filename
     finished_all = Signal()
     error = Signal(str)
 
-    def __init__(self, engine: FaceEngine, db: DatabaseManager, file_paths: list[str]):
+    def __init__(self, engine: FaceEngine, db: DatabaseManager, file_paths: list[str],
+                 num_workers: int | None = None):
         super().__init__()
         self.engine = engine
         self.db = db
         self.file_paths = file_paths
+        # CUDA 时并行意义不大（GPU 内部已并行），CPU 时按核心数并行
+        if num_workers is None:
+            if engine.backend_name == "CUDA":
+                self.num_workers = 1
+            else:
+                self.num_workers = min(os.cpu_count() or 4, 4)
+        else:
+            self.num_workers = num_workers
+
+    def _process_one(self, engine: FaceEngine, fpath: str):
+        """在工作线程中处理单张图片，返回 (fpath, image_data) 或 None"""
+        if self.db.image_exists(fpath):
+            return None
+
+        image = imread_unicode(fpath)
+        if image is None:
+            return None
+
+        h, w = image.shape[:2]
+        faces = engine.detect(image)
+        engine.extract_features(image, faces)
+        return fpath, os.path.basename(fpath), w, h, faces
 
     def run(self):
         total = len(self.file_paths)
-        for idx, fpath in enumerate(self.file_paths):
-            try:
-                self.progress.emit(idx + 1, total, os.path.basename(fpath))
+        # 每个工作线程需要独立的 engine 实例（detector 有状态）
+        engines = [self.engine.clone() for _ in range(self.num_workers)]
+        db_lock = threading.Lock()
+        counter = [0]  # 用列表以便在闭包中修改
 
-                if self.db.image_exists(fpath):
-                    continue
+        def worker(idx: int, fpath: str):
+            engine = engines[idx % self.num_workers]
+            return self._process_one(engine, fpath)
 
-                image = imread_unicode(fpath)
-                if image is None:
-                    continue
+        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            futures = {
+                pool.submit(worker, i, fpath): fpath
+                for i, fpath in enumerate(self.file_paths)
+            }
 
-                h, w = image.shape[:2]
-                faces = self.engine.detect(image)
-                self.engine.extract_features(image, faces)
+            for future in as_completed(futures):
+                fpath = futures[future]
+                counter[0] += 1
+                self.progress.emit(counter[0], total, os.path.basename(fpath))
 
-                image_id = self.db.add_image(fpath, os.path.basename(fpath), w, h, len(faces))
-                for face in faces:
-                    self.db.add_face(
-                        image_id,
-                        face.bbox,
-                        face.landmarks,
-                        face.score,
-                        face.feature,
-                    )
-            except Exception as e:
-                self.error.emit(f"{os.path.basename(fpath)}: {e}")
+                try:
+                    result = future.result()
+                    if result is None:
+                        continue
+
+                    fpath, filename, w, h, faces = result
+                    with db_lock:
+                        image_id = self.db.add_image(fpath, filename, w, h, len(faces))
+                        for face in faces:
+                            self.db.add_face(
+                                image_id, face.bbox, face.landmarks,
+                                face.score, face.feature,
+                            )
+                except Exception as e:
+                    self.error.emit(f"{os.path.basename(fpath)}: {e}")
 
         self.finished_all.emit()
 
