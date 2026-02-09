@@ -1,0 +1,366 @@
+"""主窗口 - 组装所有 UI 部件并协调业务逻辑"""
+
+import os
+import cv2
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QSplitter,
+    QToolBar, QListWidget, QListWidgetItem, QMessageBox,
+    QFileDialog, QProgressDialog, QStatusBar, QLabel,
+)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QAction
+
+from core.database import DatabaseManager
+from core.face_engine import FaceEngine, FaceData
+from core.face_cluster import FaceCluster
+from ui.image_viewer import ImageViewer
+from ui.face_list_panel import FaceListPanel
+from ui.person_panel import PersonPanel
+
+
+SUPPORTED_FORMATS = "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff *.webp)"
+
+
+# ---- 后台工作线程 ----
+
+class DetectWorker(QThread):
+    """后台人脸检测+特征提取线程"""
+
+    progress = Signal(int, int, str)  # current, total, filename
+    finished_all = Signal()
+    error = Signal(str)
+
+    def __init__(self, engine: FaceEngine, db: DatabaseManager, file_paths: list[str]):
+        super().__init__()
+        self.engine = engine
+        self.db = db
+        self.file_paths = file_paths
+
+    def run(self):
+        total = len(self.file_paths)
+        for idx, fpath in enumerate(self.file_paths):
+            try:
+                self.progress.emit(idx + 1, total, os.path.basename(fpath))
+
+                if self.db.image_exists(fpath):
+                    continue
+
+                image = cv2.imread(fpath)
+                if image is None:
+                    continue
+
+                h, w = image.shape[:2]
+                faces = self.engine.detect(image)
+                self.engine.extract_features(image, faces)
+
+                image_id = self.db.add_image(fpath, os.path.basename(fpath), w, h, len(faces))
+                for face in faces:
+                    self.db.add_face(
+                        image_id,
+                        face.bbox,
+                        face.landmarks,
+                        face.score,
+                        face.feature,
+                    )
+            except Exception as e:
+                self.error.emit(f"{os.path.basename(fpath)}: {e}")
+
+        self.finished_all.emit()
+
+
+class ClusterWorker(QThread):
+    """后台聚类线程"""
+
+    finished_cluster = Signal(dict)
+
+    def __init__(self, cluster: FaceCluster, threshold: float = 0.363):
+        super().__init__()
+        self.cluster_engine = cluster
+        self.threshold = threshold
+
+    def run(self):
+        result = self.cluster_engine.cluster(self.threshold)
+        self.finished_cluster.emit(result)
+
+
+# ---- 主窗口 ----
+
+class MainWindow(QMainWindow):
+
+    def __init__(self, engine: FaceEngine, db: DatabaseManager):
+        super().__init__()
+        self.engine = engine
+        self.db = db
+        self.cluster_engine = FaceCluster(db, engine.recognizer)
+
+        self._current_image_id: int | None = None
+        self._worker: QThread | None = None
+
+        self.setWindowTitle("FaceSeeker - 人脸识别系统")
+        self.resize(1280, 800)
+
+        self._build_toolbar()
+        self._build_ui()
+        self._build_statusbar()
+        self._load_image_list()
+
+    # ---- 构建 UI ----
+
+    def _build_toolbar(self):
+        tb = QToolBar("工具栏")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+
+        self._act_import_images = QAction("导入图片", self)
+        self._act_import_images.triggered.connect(self._on_import_images)
+        tb.addAction(self._act_import_images)
+
+        self._act_import_folder = QAction("导入文件夹", self)
+        self._act_import_folder.triggered.connect(self._on_import_folder)
+        tb.addAction(self._act_import_folder)
+
+        tb.addSeparator()
+
+        self._act_detect = QAction("开始识别", self)
+        self._act_detect.triggered.connect(self._on_detect_all)
+        tb.addAction(self._act_detect)
+
+        self._act_cluster = QAction("人脸归类", self)
+        self._act_cluster.triggered.connect(self._on_cluster)
+        tb.addAction(self._act_cluster)
+
+        tb.addSeparator()
+
+        self._act_clear = QAction("清空数据", self)
+        self._act_clear.triggered.connect(self._on_clear_all)
+        tb.addAction(self._act_clear)
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+
+        # 上半部分：图像查看器
+        top_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self._original_viewer = ImageViewer("原始图像")
+        self._result_viewer = ImageViewer("识别结果")
+        top_splitter.addWidget(self._original_viewer)
+        top_splitter.addWidget(self._result_viewer)
+        top_splitter.setStretchFactor(0, 1)
+        top_splitter.setStretchFactor(1, 1)
+
+        # 下半部分：列表与面板
+        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 图片列表
+        image_list_container = QWidget()
+        il_layout = QVBoxLayout(image_list_container)
+        il_layout.setContentsMargins(0, 0, 0, 0)
+        il_label = QLabel("图片列表")
+        il_label.setStyleSheet("font-weight: bold; font-size: 14px; padding: 4px;")
+        il_layout.addWidget(il_label)
+        self._image_list = QListWidget()
+        self._image_list.currentItemChanged.connect(self._on_image_selected)
+        il_layout.addWidget(self._image_list)
+        bottom_splitter.addWidget(image_list_container)
+
+        # 人脸列表
+        self._face_panel = FaceListPanel()
+        bottom_splitter.addWidget(self._face_panel)
+
+        # 人物归类
+        self._person_panel = PersonPanel(self.db)
+        bottom_splitter.addWidget(self._person_panel)
+
+        bottom_splitter.setStretchFactor(0, 1)
+        bottom_splitter.setStretchFactor(1, 1)
+        bottom_splitter.setStretchFactor(2, 1)
+
+        # 主分割器（上下）
+        main_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.addWidget(top_splitter)
+        main_splitter.addWidget(bottom_splitter)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+
+        root_layout.addWidget(main_splitter)
+
+    def _build_statusbar(self):
+        self._statusbar = QStatusBar()
+        self.setStatusBar(self._statusbar)
+        self._statusbar.showMessage("就绪")
+
+    # ---- 数据加载 ----
+
+    def _load_image_list(self):
+        """从数据库加载图片列表"""
+        self._image_list.clear()
+        for row in self.db.get_all_images():
+            item = QListWidgetItem(f"{row['filename']}  [{row['face_count']} 人脸]")
+            item.setData(Qt.ItemDataRole.UserRole, row["id"])
+            self._image_list.addItem(item)
+
+    def _show_image(self, image_id: int):
+        """显示选中图片的原始图 + 识别结果图"""
+        self._current_image_id = image_id
+        img_row = self.db.get_image(image_id)
+        if img_row is None:
+            return
+
+        cv_img = cv2.imread(img_row["file_path"])
+        if cv_img is None:
+            self._statusbar.showMessage(f"无法读取图片: {img_row['file_path']}")
+            return
+
+        self._original_viewer.set_image(cv_img)
+
+        # 加载人脸数据
+        face_rows = self.db.get_faces_by_image(image_id)
+        faces_data = [dict(row) for row in face_rows]
+
+        # 生成标注图
+        if faces_data:
+            face_datas = []
+            person_ids = []
+            for fd in faces_data:
+                landmarks = DatabaseManager.landmarks_from_json(fd["landmarks"])
+                face_datas.append(FaceData(
+                    bbox=(fd["bbox_x"], fd["bbox_y"], fd["bbox_w"], fd["bbox_h"]),
+                    landmarks=landmarks,
+                    score=fd["score"],
+                ))
+                person_ids.append(fd.get("person_id"))
+
+            annotated = self.engine.visualize(cv_img, face_datas, person_ids)
+            self._result_viewer.set_image(annotated)
+        else:
+            self._result_viewer.set_image(cv_img)
+
+        # 更新人脸面板
+        self._face_panel.update_faces(cv_img, faces_data)
+
+    # ---- 工具栏回调 ----
+
+    def _on_image_selected(self, current: QListWidgetItem, _previous=None):
+        if current is None:
+            return
+        image_id = current.data(Qt.ItemDataRole.UserRole)
+        self._show_image(image_id)
+
+    def _on_import_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片", "", SUPPORTED_FORMATS
+        )
+        if paths:
+            self._run_detect(paths)
+
+    def _on_import_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if not folder:
+            return
+        exts = FaceEngine.SUPPORTED_FORMATS
+        paths = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if os.path.splitext(f)[1].lower() in exts
+        ]
+        if not paths:
+            QMessageBox.information(self, "提示", "该文件夹下没有找到支持的图片格式。")
+            return
+        self._run_detect(paths)
+
+    def _on_detect_all(self):
+        """对数据库中所有未识别的图片重新识别（清空旧数据后重新导入）"""
+        images = self.db.get_all_images()
+        if not images:
+            QMessageBox.information(self, "提示", "请先导入图片。")
+            return
+        paths = [row["file_path"] for row in images]
+        # 清空旧人脸数据，重新检测（faces 会级联删除）
+        for row in images:
+            self.db.delete_image(row["id"])
+        self._run_detect(paths)
+
+    def _on_cluster(self):
+        faces = self.db.get_all_faces_with_features()
+        if not faces:
+            QMessageBox.information(self, "提示", "没有可用的人脸特征数据，请先导入并识别图片。")
+            return
+
+        self._statusbar.showMessage("正在进行人脸归类...")
+        self._set_actions_enabled(False)
+
+        worker = ClusterWorker(self.cluster_engine)
+        worker.finished_cluster.connect(self._on_cluster_done)
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_clear_all(self):
+        ret = QMessageBox.question(
+            self, "确认", "确定要清空所有数据吗？此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            self.db.clear_all_persons()
+            for row in self.db.get_all_images():
+                self.db.delete_image(row["id"])
+            self._image_list.clear()
+            self._original_viewer.clear_image()
+            self._result_viewer.clear_image()
+            self._face_panel.update_faces(None, [])
+            self._person_panel.refresh()
+            self._statusbar.showMessage("数据已清空")
+
+    # ---- 后台检测 ----
+
+    def _run_detect(self, paths: list[str]):
+        self._statusbar.showMessage("正在检测人脸...")
+        self._set_actions_enabled(False)
+
+        self._progress = QProgressDialog("正在处理图片...", "取消", 0, len(paths), self)
+        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress.setMinimumDuration(0)
+
+        worker = DetectWorker(self.engine, self.db, paths)
+        worker.progress.connect(self._on_detect_progress)
+        worker.finished_all.connect(self._on_detect_done)
+        worker.error.connect(lambda msg: self._statusbar.showMessage(f"错误: {msg}"))
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_detect_progress(self, current: int, total: int, filename: str):
+        self._progress.setLabelText(f"处理 [{current}/{total}]: {filename}")
+        self._progress.setValue(current)
+
+    def _on_detect_done(self):
+        self._progress.close()
+        self._load_image_list()
+        self._set_actions_enabled(True)
+        total_images = self._image_list.count()
+        self._statusbar.showMessage(f"检测完成，共 {total_images} 张图片")
+
+        # 自动选中第一张
+        if total_images > 0:
+            self._image_list.setCurrentRow(0)
+
+    def _on_cluster_done(self, result: dict):
+        self._set_actions_enabled(True)
+        person_count = len(result)
+        face_count = sum(len(v) for v in result.values())
+        self._statusbar.showMessage(f"归类完成: {face_count} 张人脸归为 {person_count} 个人物")
+        self._person_panel.refresh()
+
+        # 刷新当前图片显示（更新 person_id 标注）
+        if self._current_image_id is not None:
+            self._show_image(self._current_image_id)
+
+    def _set_actions_enabled(self, enabled: bool):
+        self._act_import_images.setEnabled(enabled)
+        self._act_import_folder.setEnabled(enabled)
+        self._act_detect.setEnabled(enabled)
+        self._act_cluster.setEnabled(enabled)
+        self._act_clear.setEnabled(enabled)
