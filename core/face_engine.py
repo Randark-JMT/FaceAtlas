@@ -16,7 +16,6 @@ class FaceData:
     score: float
     feature: Optional[np.ndarray] = field(default=None, repr=False)
 
-    # 用于将 FaceData 还原为 detector 格式的 numpy 数组
     def to_detect_array(self) -> np.ndarray:
         flat_landmarks = [coord for pt in self.landmarks for coord in pt]
         return np.array(
@@ -24,7 +23,6 @@ class FaceData:
         )
 
 
-# 关键点颜色 (BGR)
 def imread_unicode(filepath: str) -> np.ndarray | None:
     """读取 Unicode 路径的图像（解决 Windows 上 cv2.imread 不支持非 ASCII 路径的问题）"""
     try:
@@ -35,6 +33,20 @@ def imread_unicode(filepath: str) -> np.ndarray | None:
         return None
 
 
+def detect_backends() -> tuple[int, int, str]:
+    """检测可用的 DNN 后端，优先 CUDA > CPU。返回 (backend_id, target_id, name)"""
+    try:
+        # 尝试创建一个小的 CUDA 矩阵来验证 CUDA 是否真正可用
+        backends = cv2.dnn.getAvailableBackends()
+        cuda_pair = (cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA)
+        if cuda_pair in backends:
+            return cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA, "CUDA"
+    except Exception:
+        pass
+    return cv2.dnn.DNN_BACKEND_DEFAULT, cv2.dnn.DNN_TARGET_CPU, "CPU"
+
+
+# 关键点颜色 (BGR)
 LANDMARK_COLORS = [
     (255, 0, 0),    # 右眼
     (0, 0, 255),    # 左眼
@@ -56,6 +68,8 @@ class FaceEngine:
         score_threshold: float = 0.6,
         nms_threshold: float = 0.3,
         top_k: int = 5000,
+        backend_id: int | None = None,
+        target_id: int | None = None,
     ):
         if not os.path.exists(detection_model):
             raise FileNotFoundError(
@@ -68,11 +82,37 @@ class FaceEngine:
                 "请从 https://github.com/opencv/opencv_zoo/tree/master/models/face_recognition_sface 下载"
             )
 
+        # 保存参数用于 clone()
+        self._detection_model = detection_model
+        self._recognition_model = recognition_model
+        self._score_threshold = score_threshold
+        self._nms_threshold = nms_threshold
+        self._top_k = top_k
+
+        if backend_id is None:
+            backend_id, target_id, self.backend_name = detect_backends()
+        else:
+            self.backend_name = "CUDA" if target_id == cv2.dnn.DNN_TARGET_CUDA else "CPU"
+
+        self._backend_id = backend_id
+        self._target_id = target_id
+
         self.detector = cv2.FaceDetectorYN.create(
             detection_model, "", (320, 320),
             score_threshold, nms_threshold, top_k,
+            backend_id, target_id,
         )
-        self.recognizer = cv2.FaceRecognizerSF.create(recognition_model, "")
+        self.recognizer = cv2.FaceRecognizerSF.create(
+            recognition_model, "", backend_id, target_id,
+        )
+
+    def clone(self) -> "FaceEngine":
+        """创建一个独立的引擎实例（用于多线程，每个线程需要自己的 detector 实例）"""
+        return FaceEngine(
+            self._detection_model, self._recognition_model,
+            self._score_threshold, self._nms_threshold, self._top_k,
+            self._backend_id, self._target_id,
+        )
 
     def detect(self, image: np.ndarray) -> list[FaceData]:
         """检测图像中所有人脸"""
@@ -126,7 +166,6 @@ class FaceEngine:
             x, y, w, h = face.bbox
             cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), thickness)
 
-            # 标签
             if person_ids and idx < len(person_ids) and person_ids[idx] is not None:
                 label = f"P{person_ids[idx]} ({face.score:.2f})"
             else:
@@ -134,7 +173,6 @@ class FaceEngine:
             cv2.putText(result, label, (x, y - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-            # 关键点
             for j, (lx, ly) in enumerate(face.landmarks):
                 cv2.circle(result, (lx, ly), 3, LANDMARK_COLORS[j], thickness)
 
