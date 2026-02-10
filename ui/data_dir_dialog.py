@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
 from core.config import Config
+from ui import APP_NAME, APP_VERSION
 
 
 def _format_size(size_bytes: int) -> str:
@@ -37,7 +38,7 @@ class DataDirDialog(QDialog):
         self.config = config
         self._selected_dir: str | None = None  # None = 使用默认
 
-        self.setWindowTitle("FaceSeeker - 数据目录设置")
+        self.setWindowTitle(APP_NAME)
         self.setFixedWidth(520)
 
         self._build_ui()
