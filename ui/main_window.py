@@ -51,9 +51,11 @@ class DetectWorker(QThread):
         else:
             self.num_workers = num_workers
 
-    def _process_one(self, engine: FaceEngine, fpath: str):
+    def _process_one(self, engine: FaceEngine, db_lock: threading.Lock, fpath: str):
         """在工作线程中处理单张图片，返回 (fpath, image_data) 或 None"""
-        if self.db.image_exists(fpath):
+        with db_lock:
+            exists = self.db.image_exists(fpath)
+        if exists:
             return None
 
         image = imread_unicode(fpath)
@@ -101,7 +103,7 @@ class DetectWorker(QThread):
 
         def worker(idx: int, fpath: str):
             engine = _get_thread_engine()
-            return self._process_one(engine, fpath)
+            return self._process_one(engine, db_lock, fpath)
 
         with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
             futures = {
