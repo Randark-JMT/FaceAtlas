@@ -49,8 +49,14 @@ class PersonGroup(QFrame):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # 标题行：名称编辑 + 人脸数
+        # 标题行：编号 + 名称编辑 + 人脸数
         header = QHBoxLayout()
+        # 显示人物编号
+        person_id_label = QLabel(f"P{person_id}")
+        person_id_label.setStyleSheet("font-weight: bold; color: #4a9eff; font-size: 13px;")
+        person_id_label.setFixedWidth(40)
+        header.addWidget(person_id_label)
+        
         self._name_edit = QLineEdit(name)
         self._name_edit.setFixedWidth(120)
         self._name_edit.setStyleSheet("background: #3a3a3a; border: 1px solid #555; padding: 2px 4px;")
