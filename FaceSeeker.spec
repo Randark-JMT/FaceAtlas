@@ -6,7 +6,12 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('models', 'models')],
-    hiddenimports=[],
+    hiddenimports=[
+        'rich._unicode_data',
+        'rich._unicode_data.unicode17-0-0',
+        'rich._loop',
+        'rich._palettes',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
