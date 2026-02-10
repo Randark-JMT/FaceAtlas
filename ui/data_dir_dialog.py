@@ -39,7 +39,6 @@ class DataDirDialog(QDialog):
 
         self.setWindowTitle("FaceSeeker - 数据目录设置")
         self.setFixedWidth(520)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
 
         self._build_ui()
         self._apply_style()

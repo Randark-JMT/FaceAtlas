@@ -66,8 +66,8 @@ def main():
 
     if need_dialog:
         if not show_data_dir_dialog(config):
-            # 用户关闭了对话框，使用默认目录
-            config.set_data_dir(None)
+            # 用户关闭了对话框，直接退出程序
+            sys.exit(0)
 
     # 初始化日志系统（必须在数据目录确定之后）
     logger = setup_logger(config.log_path)
