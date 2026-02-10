@@ -292,6 +292,9 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{display_name}  [{row['face_count']} 人脸]")
             item.setData(Qt.ItemDataRole.UserRole, row["id"])
             self._image_list.addItem(item)
+        
+        # 同时加载人物归类数据
+        self._person_panel.refresh()
 
     def _show_image(self, image_id: int):
         """显示选中图片的原始图 + 识别结果图"""

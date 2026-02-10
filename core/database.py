@@ -50,6 +50,7 @@ class DatabaseManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT DEFAULT '未命名',
                 face_count INTEGER DEFAULT 0,
+                feature BLOB,
                 created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -204,10 +205,57 @@ class DatabaseManager:
         )
         self._maybe_commit()
 
-    def clear_all_persons(self):
-        """清除所有人物归类（重新聚类前调用）"""
-        self.conn.execute("UPDATE faces SET person_id = NULL")
-        self.conn.execute("DELETE FROM persons")
+    def update_person_feature(self, person_id: int, feature: Optional[np.ndarray]):
+        """更新人物的代表性特征向量"""
+        feature_blob = feature.tobytes() if feature is not None else None
+        self.conn.execute(
+            "UPDATE persons SET feature = ? WHERE id = ?", (feature_blob, person_id)
+        )
+        self._maybe_commit()
+
+    def get_person_feature(self, person_id: int) -> Optional[np.ndarray]:
+        """获取人物的代表性特征向量"""
+        row = self.conn.execute(
+            "SELECT feature FROM persons WHERE id = ?", (person_id,)
+        ).fetchone()
+        if row and row["feature"]:
+            return self.feature_from_blob(row["feature"])
+        return None
+
+    def get_persons_with_features(self) -> list:
+        """获取所有有代表性特征的人物"""
+        return self.conn.execute(
+            "SELECT * FROM persons WHERE feature IS NOT NULL"
+        ).fetchall()
+
+    def get_unassigned_faces_with_features(self) -> list:
+        """获取所有未分配人物的人脸（有特征向量）"""
+        return self.conn.execute(
+            "SELECT * FROM faces WHERE feature IS NOT NULL AND person_id IS NULL"
+        ).fetchall()
+
+    def clear_all_persons(self, keep_named: bool = False):
+        """清除人物归类
+        
+        Args:
+            keep_named: 如果为True，则保留已命名的人物（非"未命名"），
+                       只清除未命名的人物归类
+        """
+        if keep_named:
+            # 只删除未命名的人物
+            unnamed_ids = self.conn.execute(
+                "SELECT id FROM persons WHERE name = '未命名'"
+            ).fetchall()
+            for row in unnamed_ids:
+                self.conn.execute(
+                    "UPDATE faces SET person_id = NULL WHERE person_id = ?",
+                    (row["id"],)
+                )
+            self.conn.execute("DELETE FROM persons WHERE name = '未命名'")
+        else:
+            # 清除所有人物
+            self.conn.execute("UPDATE faces SET person_id = NULL")
+            self.conn.execute("DELETE FROM persons")
         self._maybe_commit()
 
     # ---- Transaction ----

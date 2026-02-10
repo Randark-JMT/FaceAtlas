@@ -45,7 +45,7 @@ class FaceCluster:
         self.logger = get_logger()
 
     def cluster(self, cosine_threshold: float = 0.363,
-                progress_cb=None) -> dict[int, list[int]]:
+                progress_cb=None, incremental: bool = True) -> dict[int, list[int]]:
         """
         对数据库中所有有特征的人脸进行聚类。
         使用 numpy 向量化矩阵乘法计算余弦相似度，性能远优于逐对调用。
@@ -53,6 +53,7 @@ class FaceCluster:
         Args:
             cosine_threshold: 余弦相似度阈值（SFace 推荐 0.363）
             progress_cb: 进度回调 (current, total, stage_text)
+            incremental: 是否增量聚类（保留已有人物归类）
 
         Returns:
             {person_id: [face_id, ...]} 聚类结果
@@ -62,26 +63,106 @@ class FaceCluster:
             if progress_cb:
                 progress_cb(current, total, text)
         
-        self.logger.info(f"开始人脸聚类，阈值={cosine_threshold:.3f}")
+        self.logger.info(f"开始人脸聚类，阈值={cosine_threshold:.3f}，增量模式={incremental}")
 
-        # 清除旧的归类
-        _report(0, 1, "清除旧归类数据...")
-        self.db.clear_all_persons()
+        if incremental:
+            # 增量模式：只清除未命名的人物
+            _report(0, 1, "清除未命名人物...")
+            self.db.clear_all_persons(keep_named=True)
+            
+            # 获取已有人物及其特征
+            _report(0, 1, "加载已有人物特征...")
+            existing_persons = self.db.get_persons_with_features()
+            person_features: dict[int, np.ndarray] = {}
+            for person in existing_persons:
+                feat = self.db.get_person_feature(person["id"])
+                if feat is not None:
+                    person_features[person["id"]] = feat.flatten()
+            
+            # 只获取未分配的人脸
+            rows = self.db.get_unassigned_faces_with_features()
+            self.logger.info(f"增量模式：已有 {len(existing_persons)} 个人物，"
+                           f"{len(rows)} 张未分配人脸")
+        else:
+            # 全量模式：清除所有旧归类
+            _report(0, 1, "清除旧归类数据...")
+            self.db.clear_all_persons(keep_named=False)
+            rows = self.db.get_all_faces_with_features()
+            person_features = {}
 
-        rows = self.db.get_all_faces_with_features()
-        if not rows:
+        if not rows and not person_features:
             return {}
 
-        # 加载 face_id 和特征
-        _report(0, 1, "加载人脸特征...")
+        # 先处理与已有人物的匹配（增量模式）
+        assigned_to_existing: dict[int, list[int]] = defaultdict(list)  # person_id -> [face_id]
+        unmatched_rows = []
+        
+        if incremental and person_features:
+            _report(0, len(rows), "与已有人物匹配中...")
+            # 构建已有人物特征矩阵
+            person_ids_list = list(person_features.keys())
+            person_feat_matrix = np.vstack([person_features[pid] for pid in person_ids_list])
+            person_feat_matrix = person_feat_matrix.astype(np.float32)
+            norms = np.linalg.norm(person_feat_matrix, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)
+            person_feat_matrix /= norms
+            
+            # 逐个人脸与已有人物比对
+            for i, row in enumerate(rows):
+                if (i + 1) % 10 == 0:
+                    _report(i + 1, len(rows), f"匹配进度: {i + 1}/{len(rows)}")
+                
+                feat = DatabaseManager.feature_from_blob(row["feature"])
+                feat = feat.flatten().astype(np.float32)
+                feat = feat / max(np.linalg.norm(feat), 1e-10)
+                
+                # 与所有已有人物比对
+                similarities = person_feat_matrix @ feat
+                max_sim = np.max(similarities)
+                
+                if max_sim >= cosine_threshold:
+                    # 匹配到已有人物
+                    best_person_idx = np.argmax(similarities)
+                    best_person_id = person_ids_list[best_person_idx]
+                    assigned_to_existing[best_person_id].append(row["id"])
+                else:
+                    # 未匹配，待后续聚类
+                    unmatched_rows.append(row)
+            
+            self.logger.info(f"匹配完成：{len(rows) - len(unmatched_rows)} 张人脸匹配到已有人物，"
+                           f"{len(unmatched_rows)} 张人脸需要新建归类")
+        else:
+            unmatched_rows = rows
+
+        # 对未匹配的人脸进行聚类
         face_ids: list[int] = []
         feat_list: list[np.ndarray] = []
-        for row in rows:
+        for row in unmatched_rows:
             face_ids.append(row["id"])
             feat = DatabaseManager.feature_from_blob(row["feature"])
             feat_list.append(feat.flatten())
 
         n = len(face_ids)
+        
+        if n == 0:
+            # 所有人脸都已匹配到已有人物
+            _report(1, 1, "正在更新数据库...")
+            self.db.begin()
+            try:
+                all_updates: list[tuple[int, int]] = []
+                for person_id, fids in assigned_to_existing.items():
+                    face_count = self.db.get_faces_by_person(person_id)
+                    self.db.update_person_face_count(person_id, len(face_count) + len(fids))
+                    for fid in fids:
+                        all_updates.append((person_id, fid))
+                self.db.batch_update_face_persons(all_updates)
+                self.db.commit()
+                self.logger.info(f"所有人脸已分配到已有人物")
+            except Exception as e:
+                self.logger.error(f"更新数据库失败: {e}", exc_info=True)
+                self.db.rollback()
+                raise
+            return {pid: fids for pid, fids in assigned_to_existing.items()}
 
         # 构建特征矩阵 (n, dim) 并 L2 归一化
         feat_matrix = np.vstack(feat_list).astype(np.float32)  # (n, dim)
@@ -89,7 +170,7 @@ class FaceCluster:
         norms = np.maximum(norms, 1e-10)  # 避免除零
         feat_matrix /= norms
 
-        _report(0, n, f"加载 {n} 张人脸，开始向量化比对...")
+        _report(0, n, f"加载 {n} 张待聚类人脸，开始向量化比对...")
 
         # Union-Find 聚类（基于索引 0..n-1）
         uf = UnionFind(n)
@@ -136,16 +217,62 @@ class FaceCluster:
         self.db.begin()
         try:
             all_updates: list[tuple[int, int]] = []
-            for group_face_ids in groups.values():
+            
+            # 处理新增的人物组
+            for root_idx, group_face_ids in groups.items():
                 person_id = self.db.add_person()
                 self.db.update_person_face_count(person_id, len(group_face_ids))
+                
+                # 计算该人物的代表性特征（所有人脸特征的平均值）
+                group_feats = []
+                for idx in range(n):
+                    if uf.find(idx) == root_idx:
+                        group_feats.append(feat_matrix[idx])
+                if group_feats:
+                    avg_feat = np.mean(group_feats, axis=0)
+                    avg_feat = avg_feat / max(np.linalg.norm(avg_feat), 1e-10)  # L2归一化
+                    self.db.update_person_feature(person_id, avg_feat)
+                
                 for fid in group_face_ids:
                     all_updates.append((person_id, fid))
                 result[person_id] = group_face_ids
+            
+            # 处理匹配到已有人物的人脸
+            for person_id, fids in assigned_to_existing.items():
+                for fid in fids:
+                    all_updates.append((person_id, fid))
+                
+                # 更新人物的人脸数量和特征
+                all_person_faces = self.db.get_faces_by_person(person_id)
+                self.db.update_person_face_count(person_id, len(all_person_faces) + len(fids))
+                
+                # 重新计算该人物的代表性特征
+                person_feats = []
+                for face_row in all_person_faces:
+                    if face_row["feature"]:
+                        feat = DatabaseManager.feature_from_blob(face_row["feature"])
+                        person_feats.append(feat.flatten())
+                # 加上新分配的人脸
+                for fid in fids:
+                    face_row = self.db.get_face(fid)
+                    if face_row and face_row["feature"]:
+                        feat = DatabaseManager.feature_from_blob(face_row["feature"])
+                        person_feats.append(feat.flatten())
+                
+                if person_feats:
+                    avg_feat = np.mean(person_feats, axis=0)
+                    avg_feat = avg_feat / max(np.linalg.norm(avg_feat), 1e-10)
+                    self.db.update_person_feature(person_id, avg_feat)
+                
+                result[person_id] = fids
+            
             # 批量更新 face -> person 映射
             self.db.batch_update_face_persons(all_updates)
             self.db.commit()
-            self.logger.info(f"聚类结果已写入数据库，共 {len(result)} 个人物")
+            total_new_persons = len(groups)
+            total_updated_persons = len(assigned_to_existing)
+            self.logger.info(f"聚类结果已写入数据库，新建 {total_new_persons} 个人物，"
+                           f"更新 {total_updated_persons} 个已有人物")
         except Exception as e:
             self.logger.error(f"聚类写入数据库失败: {e}", exc_info=True)
             self.db.rollback()
