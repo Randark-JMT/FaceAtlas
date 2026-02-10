@@ -3,3 +3,5 @@ numpy
 pyside6
 pyinstaller
 rich
+nuitka
+zstandard
