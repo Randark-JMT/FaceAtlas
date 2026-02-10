@@ -51,13 +51,8 @@ class DetectWorker(QThread):
         else:
             self.num_workers = num_workers
 
-    def _process_one(self, engine: FaceEngine, db_lock: threading.Lock, fpath: str):
-        """在工作线程中处理单张图片，返回 (fpath, image_data) 或 None"""
-        with db_lock:
-            exists = self.db.image_exists(fpath)
-        if exists:
-            return None
-
+    def _process_one(self, engine: FaceEngine, fpath: str):
+        """在工作线程中处理单张图片（纯计算，不访问数据库）"""
         image = imread_unicode(fpath)
         if image is None:
             return None
@@ -81,14 +76,19 @@ class DetectWorker(QThread):
 
     def run(self):
         total = len(self.file_paths)
+
+        # 先在主线程（QThread）中预过滤已存在的图片，避免 worker 线程访问数据库
+        pending_paths = [p for p in self.file_paths if not self.db.image_exists(p)]
+        skipped = total - len(pending_paths)
+        if skipped > 0:
+            get_logger().info(f"跳过 {skipped} 张已存在的图片")
+
         # 每个工作线程需要独立的 engine 实例（detector 有状态）
         # 使用 thread-local 确保每个线程独占自己的 engine，避免并发访问
         _local = threading.local()
         engines = [self.engine.clone() for _ in range(self.num_workers)]
-        engine_locks = [threading.Lock() for _ in range(self.num_workers)]
         _engine_idx = [0]  # 分配计数器
         _idx_lock = threading.Lock()
-        db_lock = threading.Lock()
 
         def _get_thread_engine() -> FaceEngine:
             """每个线程首次调用时分配一个独占的 engine 实例"""
@@ -103,18 +103,18 @@ class DetectWorker(QThread):
 
         def worker(idx: int, fpath: str):
             engine = _get_thread_engine()
-            return self._process_one(engine, db_lock, fpath)
+            return self._process_one(engine, fpath)
 
         with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
             futures = {
                 pool.submit(worker, i, fpath): fpath
-                for i, fpath in enumerate(self.file_paths)
+                for i, fpath in enumerate(pending_paths)
             }
 
             for future in as_completed(futures):
                 fpath = futures[future]
                 counter[0] += 1
-                self.progress.emit(counter[0], total, os.path.basename(fpath))
+                self.progress.emit(skipped + counter[0], total, os.path.basename(fpath))
 
                 try:
                     result = future.result()
@@ -122,13 +122,13 @@ class DetectWorker(QThread):
                         continue
 
                     fpath, filename, w, h, faces, relative_path = result
-                    with db_lock:
-                        image_id = self.db.add_image(fpath, filename, w, h, len(faces), relative_path)
-                        for face in faces:
-                            self.db.add_face(
-                                image_id, face.bbox, face.landmarks,
-                                face.score, face.feature,
-                            )
+                    # 所有 DB 操作都在 QThread 的 run() 中顺序执行，无需加锁
+                    image_id = self.db.add_image(fpath, filename, w, h, len(faces), relative_path)
+                    for face in faces:
+                        self.db.add_face(
+                            image_id, face.bbox, face.landmarks,
+                            face.score, face.feature,
+                        )
                 except Exception as e:
                     logger = get_logger()
                     log_opencv_error("DetectWorker._process_one", e, suppress=True)
