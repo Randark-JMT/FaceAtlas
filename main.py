@@ -10,6 +10,7 @@ from core.config import get_config
 from core.logger import setup_logger, get_logger, console
 from core.database import DatabaseManager
 from core.face_engine import FaceEngine
+from ui import APP_NAME, APP_VERSION
 from ui.main_window import MainWindow
 from ui.data_dir_dialog import show_data_dir_dialog
 
@@ -120,7 +121,7 @@ def main():
         sys.exit(1)
 
     window = MainWindow(engine, db, config)
-    window.setWindowTitle(f"FaceSeeker - 人脸识别系统  [后端: {engine.backend_name}]")
+    window.setWindowTitle(f"{APP_NAME} - {APP_VERSION}  [后端: {engine.backend_name}]")
     window.show()
     
     logger.info("主窗口已显示，程序就绪")
