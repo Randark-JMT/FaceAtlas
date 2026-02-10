@@ -29,7 +29,12 @@ def imread_unicode(filepath: str) -> np.ndarray | None:
     """读取 Unicode 路径的图像（解决 Windows 上 cv2.imread 不支持非 ASCII 路径的问题）"""
     try:
         buf = np.fromfile(filepath, dtype=np.uint8)
+        if buf.size == 0:
+            return None
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        # 验证图像有效性：不为 None，维度正确，且有实际内容
+        if img is None or img.size == 0 or len(img.shape) < 2:
+            return None
         return img
     except Exception as e:
         log_opencv_error("imread_unicode", e, suppress=True)
@@ -137,8 +142,17 @@ class FaceEngine:
             min_face_size: 最小人脸尺寸，低于此值的检测结果会被过滤。
                            None 时使用类默认值 MIN_FACE_SIZE。
         """
+        # 验证输入图像的有效性
+        if image is None or image.size == 0 or len(image.shape) < 2:
+            self.logger.warning("detect: 输入图像无效")
+            return []
+        
         try:
             h, w = image.shape[:2]
+            if h <= 0 or w <= 0:
+                self.logger.warning(f"detect: 图像尺寸无效 ({w}x{h})")
+                return []
+            
             self.detector.setInputSize((w, h))
             _, raw_faces = self.detector.detect(image)
 
@@ -168,8 +182,20 @@ class FaceEngine:
 
     def extract_feature(self, image: np.ndarray, face: FaceData) -> np.ndarray:
         """提取单张人脸的特征向量（L2 归一化）"""
+        # 验证输入图像的有效性
+        if image is None or image.size == 0 or len(image.shape) < 2:
+            self.logger.warning("extract_feature: 输入图像无效")
+            face.feature = None
+            return np.zeros(128, dtype=np.float32)
+        
         try:
             aligned = self.recognizer.alignCrop(image, face.to_detect_array())
+            # 验证对齐后的图像是否有效
+            if aligned is None or aligned.size == 0:
+                self.logger.warning("extract_feature: 人脸对齐失败")
+                face.feature = None
+                return np.zeros(128, dtype=np.float32)
+            
             feature = self.recognizer.feature(aligned)
             # L2 归一化，确保后续余弦相似度计算的数值稳定性
             norm = np.linalg.norm(feature)
