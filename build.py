@@ -23,7 +23,8 @@ def build():
         "--output-filename=FaceSeeker.exe",
         
         # Windows 设置
-        "--windows-console-mode=attach",  # 附加到控制台（用于调试），可改为 disable
+        # "--windows-console-mode=attach",  # 附加到控制台（用于调试），可改为 disable
+        "--enable-plugin=pyside6",  # 如果使用 PySide6，启用插件
         # "--windows-icon-from-ico=icon.ico",  # 如果有图标文件，取消注释
         
         # 包含必要的包（解决 rich 的动态导入问题）
