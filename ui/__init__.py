@@ -1,2 +1,2 @@
-APP_NAME = "FaceSeeker - 数据目录设置"
+APP_NAME = "FaceSeeker - 人脸识别系统"
 APP_VERSION = "v0.5.5"
