@@ -2,3 +2,10 @@ faceseeker.db
 **/__pycache__/
 dist/
 build/
+
+.venv/
+
+*.build/
+*.dist/
+*.onefile-build/
+*.exe
