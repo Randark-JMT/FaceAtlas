@@ -126,15 +126,17 @@ class ClusterWorker(QThread):
     progress = Signal(int, int, str)  # current, total, stage_text
     finished_cluster = Signal(dict)
 
-    def __init__(self, cluster: FaceCluster, threshold: float = 0.363):
+    def __init__(self, cluster: FaceCluster, threshold: float = 0.363, incremental: bool = True):
         super().__init__()
         self.cluster_engine = cluster
         self.threshold = threshold
+        self.incremental = incremental
 
     def run(self):
         result = self.cluster_engine.cluster(
             self.threshold,
             progress_cb=lambda cur, tot, txt: self.progress.emit(cur, tot, txt),
+            incremental=self.incremental,
         )
         self.finished_cluster.emit(result)
 
@@ -413,7 +415,8 @@ class MainWindow(QMainWindow):
         self._cluster_progress.setMinimumDuration(0)
         self._cluster_progress.setValue(0)
 
-        worker = ClusterWorker(self.cluster_engine, threshold)
+        # 使用增量聚类模式（保留已命名的人物）
+        worker = ClusterWorker(self.cluster_engine, threshold, incremental=True)
         worker.progress.connect(self._on_cluster_progress)
         worker.finished_cluster.connect(self._on_cluster_done)
         worker.finished.connect(worker.deleteLater)

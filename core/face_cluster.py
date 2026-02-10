@@ -150,19 +150,40 @@ class FaceCluster:
             self.db.begin()
             try:
                 all_updates: list[tuple[int, int]] = []
+                result: dict[int, list[int]] = {}
                 for person_id, fids in assigned_to_existing.items():
-                    face_count = self.db.get_faces_by_person(person_id)
-                    self.db.update_person_face_count(person_id, len(face_count) + len(fids))
+                    # 更新人脸数量
+                    all_person_faces = self.db.get_faces_by_person(person_id)
+                    self.db.update_person_face_count(person_id, len(all_person_faces) + len(fids))
+                    
+                    # 更新人物特征
+                    person_feats = []
+                    for face_row in all_person_faces:
+                        if face_row["feature"]:
+                            feat = DatabaseManager.feature_from_blob(face_row["feature"])
+                            person_feats.append(feat.flatten())
+                    for fid in fids:
+                        face_row = self.db.get_face(fid)
+                        if face_row and face_row["feature"]:
+                            feat = DatabaseManager.feature_from_blob(face_row["feature"])
+                            person_feats.append(feat.flatten())
+                    if person_feats:
+                        avg_feat = np.mean(person_feats, axis=0)
+                        avg_feat = avg_feat / max(np.linalg.norm(avg_feat), 1e-10)
+                        self.db.update_person_feature(person_id, avg_feat)
+                    
                     for fid in fids:
                         all_updates.append((person_id, fid))
+                    result[person_id] = fids
+                    
                 self.db.batch_update_face_persons(all_updates)
                 self.db.commit()
-                self.logger.info(f"所有人脸已分配到已有人物")
+                self.logger.info(f"所有人脸已分配到已有人物，更新了 {len(result)} 个人物")
             except Exception as e:
                 self.logger.error(f"更新数据库失败: {e}", exc_info=True)
                 self.db.rollback()
                 raise
-            return {pid: fids for pid, fids in assigned_to_existing.items()}
+            return result
 
         # 构建特征矩阵 (n, dim) 并 L2 归一化
         feat_matrix = np.vstack(feat_list).astype(np.float32)  # (n, dim)
@@ -264,7 +285,10 @@ class FaceCluster:
                     avg_feat = avg_feat / max(np.linalg.norm(avg_feat), 1e-10)
                     self.db.update_person_feature(person_id, avg_feat)
                 
-                result[person_id] = fids
+                # result 中存储该人物新增的 face_ids（用于日志统计）
+                if person_id not in result:
+                    result[person_id] = []
+                result[person_id].extend(fids)
             
             # 批量更新 face -> person 映射
             self.db.batch_update_face_persons(all_updates)
