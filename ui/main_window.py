@@ -196,8 +196,8 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
         
-        # 设置缓存目录按钮
-        self._act_set_cache = QAction("设置缓存目录", self)
+        # 设置数据目录按钮
+        self._act_set_cache = QAction("设置数据目录", self)
         self._act_set_cache.triggered.connect(self._on_set_cache_dir)
         tb.addAction(self._act_set_cache)
 
@@ -440,49 +440,38 @@ class MainWindow(QMainWindow):
             self.logger.info("数据清空完成")
     
     def _on_set_cache_dir(self):
-        """设置缓存目录"""
-        current_dir = self.config.cache_dir
-        new_dir = QFileDialog.getExistingDirectory(
-            self, "选择缓存目录", current_dir,
-            QFileDialog.Option.ShowDirsOnly
-        )
-        if not new_dir:
+        """设置数据目录"""
+        from ui.data_dir_dialog import DataDirDialog
+        
+        dlg = DataDirDialog(self.config, self)
+        if dlg.exec() != DataDirDialog.DialogCode.Accepted:
             return
         
-        if new_dir == current_dir:
-            QMessageBox.information(self, "提示", "缓存目录未改变")
+        new_dir = dlg.get_selected_dir()  # None = 使用默认
+        effective_new = new_dir if new_dir else self.config.default_data_dir
+        current_dir = self.config.data_dir
+        
+        if os.path.normpath(effective_new) == os.path.normpath(current_dir):
+            QMessageBox.information(self, "提示", "数据目录未改变")
             return
         
-        # 警告用户更改缓存目录的影响
-        ret = QMessageBox.question(
-            self, "确认更改缓存目录",
-            f"即将更改缓存目录为:\n{new_dir}\n\n"
-            "注意：\n"
-            "1. 数据库文件将存储到新目录\n"
-            "2. 当前加载的数据将被清空\n"
-            "3. 程序将重新启动以应用更改\n\n"
-            "是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        
-        if ret == QMessageBox.StandardButton.Yes:
-            self.logger.info(f"用户更改缓存目录: {current_dir} -> {new_dir}")
-            try:
-                self.config.cache_dir = new_dir
-                self.logger.info(f"缓存目录已更新，新的数据库路径: {self.config.database_path}")
-                QMessageBox.information(
-                    self, "成功",
-                    f"缓存目录已更改为:\n{new_dir}\n\n"
-                    f"数据库路径: {self.config.database_path}\n"
-                    f"日志路径: {self.config.log_path}\n\n"
-                    "请重启程序以应用更改。"
-                )
-            except Exception as e:
-                self.logger.error(f"设置缓存目录失败: {e}", exc_info=True)
-                QMessageBox.critical(
-                    self, "错误",
-                    f"设置缓存目录失败:\n{str(e)}"
-                )
+        self.logger.info(f"用户更改数据目录: {current_dir} -> {effective_new}")
+        try:
+            self.config.set_data_dir(new_dir)
+            self.logger.info(f"数据目录已更新，新的数据库路径: {self.config.database_path}")
+            QMessageBox.information(
+                self, "成功",
+                f"数据目录已更改为:\n{self.config.data_dir}\n\n"
+                f"数据库路径: {self.config.database_path}\n"
+                f"日志路径: {self.config.log_path}\n\n"
+                "请重启程序以应用更改。"
+            )
+        except Exception as e:
+            self.logger.error(f"设置数据目录失败: {e}", exc_info=True)
+            QMessageBox.critical(
+                self, "错误",
+                f"设置数据目录失败:\n{str(e)}"
+            )
 
     # ---- 后台检测 ----
 

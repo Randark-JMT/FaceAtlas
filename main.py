@@ -11,21 +11,13 @@ from core.logger import setup_logger, get_logger, console
 from core.database import DatabaseManager
 from core.face_engine import FaceEngine
 from ui.main_window import MainWindow
+from ui.data_dir_dialog import show_data_dir_dialog
 
 
 def main():
     # 初始化配置
     config = get_config()
-    
-    # 初始化日志系统
-    logger = setup_logger(config.log_path)
-    logger.info("=" * 60)
-    logger.info("FaceSeeker 启动")
-    logger.info(f"缓存目录: {config.cache_dir}")
-    logger.info(f"数据库路径: {config.database_path}")
-    logger.info(f"日志路径: {config.log_path}")
-    logger.info("=" * 60)
-    
+
     app = QApplication(sys.argv)
 
     # 全局暗色样式
@@ -62,6 +54,29 @@ def main():
             border: none;
         }
     """)
+
+    # ---- 首次启动或数据目录失效时，弹出数据目录选择对话框 ----
+    need_dialog = False
+    if not config.is_data_dir_configured:
+        # 从未配置过：首次启动
+        need_dialog = True
+    elif config._data_dir and not os.path.isdir(config._data_dir):
+        # 之前配置的自定义目录已不存在
+        need_dialog = True
+
+    if need_dialog:
+        if not show_data_dir_dialog(config):
+            # 用户关闭了对话框，使用默认目录
+            config.set_data_dir(None)
+
+    # 初始化日志系统（必须在数据目录确定之后）
+    logger = setup_logger(config.log_path)
+    logger.info("=" * 60)
+    logger.info("FaceSeeker 启动")
+    logger.info(f"数据目录: {config.data_dir}")
+    logger.info(f"数据库路径: {config.database_path}")
+    logger.info(f"日志路径: {config.log_path}")
+    logger.info("=" * 60)
     # 获取模型文件路径（只读资源，从资源目录读取）
     detection_model = config.get_resource_path(os.path.join("models", "face_detection_yunet_2023mar.onnx"))
     recognition_model = config.get_resource_path(os.path.join("models", "face_recognition_sface_2021dec.onnx"))
@@ -115,18 +130,6 @@ def main():
     db.close()
     logger.info("数据库已关闭")
     logger.info("FaceSeeker 已退出")
-    sys.exit(1)
-
-    # 初始化核心组件
-    db = DatabaseManager(DB_PATH)
-    engine = FaceEngine(DETECTION_MODEL, RECOGNITION_MODEL)
-
-    window = MainWindow(engine, db)
-    window.setWindowTitle(f"FaceSeeker - 人脸识别系统  [后端: {engine.backend_name}]")
-    window.show()
-
-    ret = app.exec()
-    db.close()
     sys.exit(ret)
 
 
