@@ -46,7 +46,7 @@ def build():
         # 优化选项
         "--assume-yes-for-downloads",
         "--show-progress",
-        "--show-memory",
+        # "--show-memory",
         
         # 移除一些警告
         # "--nowarn-mnemonic",
