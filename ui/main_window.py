@@ -56,9 +56,9 @@ class DetectWorker(QThread):
         self.file_paths = file_paths
         self.base_folder = base_folder
         self.thumb_cache = thumb_cache
-        # CUDA 时并行意义不大（GPU 内部已并行），CPU 时按核心数并行
+        # GPU 后端（CUDA / OpenCL）时并行意义不大，CPU 时按核心数并行
         if num_workers is None:
-            if engine.backend_name == "CUDA":
+            if engine.backend_name in ("CUDA", "OpenCL"):
                 self.num_workers = 1
             else:
                 self.num_workers = min(os.cpu_count() or 4, 4)

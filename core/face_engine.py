@@ -87,18 +87,37 @@ def _normalize_image(img: np.ndarray) -> np.ndarray | None:
 
 
 def detect_backends() -> tuple[int, int, str]:
-    """检测可用的 DNN 后端，优先 CUDA > CPU。返回 (backend_id, target_id, name)"""
+    """检测可用的 DNN 后端，优先级: CUDA > OpenCL > CPU。返回 (backend_id, target_id, name)"""
     logger = get_logger()
+
+    # 候选后端列表（按优先级排列）
+    candidates = [
+        # (backend_id, target_id, display_name)
+        (cv2.dnn.DNN_BACKEND_CUDA,   cv2.dnn.DNN_TARGET_CUDA,       "CUDA"),
+        (cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_OPENCL,     "OpenCL"),
+    ]
+
     try:
-        # 尝试创建一个小的 CUDA 矩阵来验证 CUDA 是否真正可用
-        backends = cv2.dnn.getAvailableBackends()
-        cuda_pair = (cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA)
-        if cuda_pair in backends:
-            logger.info("检测到 CUDA 后端可用")
-            return cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA, "CUDA"
+        if hasattr(cv2.dnn, 'getAvailableTargets'):
+            # OpenCV 4.13+ 新 API
+            for backend_id, target_id, name in candidates:
+                try:
+                    targets = cv2.dnn.getAvailableTargets(backend_id)
+                    if target_id in targets:
+                        logger.info(f"检测到 {name} 后端可用")
+                        return backend_id, target_id, name
+                except Exception:
+                    continue
+        elif hasattr(cv2.dnn, 'getAvailableBackends'):
+            # 兼容旧版 OpenCV (<4.13)
+            available = cv2.dnn.getAvailableBackends()
+            for backend_id, target_id, name in candidates:
+                if (backend_id, target_id) in available:
+                    logger.info(f"检测到 {name} 后端可用")
+                    return backend_id, target_id, name
     except Exception as e:
         log_opencv_error("detect_backends", e, suppress=True)
-    
+
     logger.info("使用 CPU 后端")
     return cv2.dnn.DNN_BACKEND_DEFAULT, cv2.dnn.DNN_TARGET_CPU, "CPU"
 
