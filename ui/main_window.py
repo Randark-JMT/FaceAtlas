@@ -295,7 +295,7 @@ class MainWindow(QMainWindow):
         self._thresh_slider.setFixedWidth(120)
         self._thresh_slider.setToolTip("调整人脸聚类的余弦相似度阈值\n值越高→分类越严格，人物组越多\n值越低→分类越宽松，更容易合并")
         tb.addWidget(self._thresh_slider)
-        self._thresh_value_label = QLabel("0.36")
+        self._thresh_value_label = QLabel("0.60")
         self._thresh_value_label.setFixedWidth(36)
         self._thresh_value_label.setStyleSheet("padding: 0 4px;")
         tb.addWidget(self._thresh_value_label)
