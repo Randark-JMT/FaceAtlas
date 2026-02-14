@@ -26,6 +26,10 @@ class DatabaseManager:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        # 性能优化 PRAGMA
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA cache_size = -8000")    # 8 MB 页缓存
+        self.conn.execute("PRAGMA temp_store = MEMORY")
 
     def _maybe_commit(self):
         """仅在非事务模式下自动提交"""
@@ -92,9 +96,21 @@ class DatabaseManager:
         self._maybe_commit()
         return cur.lastrowid
 
+    def get_image_count(self) -> int:
+        """获取图片总数（轻量查询）"""
+        row = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()
+        return row[0] if row else 0
+
     def get_all_images(self) -> list:
         return self.conn.execute(
             "SELECT * FROM images ORDER BY added_time DESC"
+        ).fetchall()
+
+    def get_images_paginated(self, offset: int, limit: int) -> list:
+        """分页获取图片列表（避免一次性加载全部）"""
+        return self.conn.execute(
+            "SELECT * FROM images ORDER BY added_time DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
 
     def get_image(self, image_id: int):
@@ -133,10 +149,37 @@ class DatabaseManager:
         self._maybe_commit()
         return cur.lastrowid
 
+    def add_faces_batch(self, faces: list[tuple]) -> list[int]:
+        """批量插入人脸数据（在已有事务中调用效果最佳）
+        
+        Args:
+            faces: [(image_id, bbox, landmarks, score, feature, person_id), ...]
+        
+        Returns:
+            插入的 face_id 列表
+        """
+        ids = []
+        for image_id, bbox, landmarks, score, feature, person_id in faces:
+            feature_blob = feature.tobytes() if feature is not None else None
+            landmarks_json = json.dumps(landmarks)
+            cur = self.conn.execute(
+                "INSERT INTO faces (image_id, bbox_x, bbox_y, bbox_w, bbox_h, landmarks, score, feature, person_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, bbox[0], bbox[1], bbox[2], bbox[3], landmarks_json, score, feature_blob, person_id),
+            )
+            ids.append(cur.lastrowid)
+        self._maybe_commit()
+        return ids
+
     def get_faces_by_image(self, image_id: int) -> list:
         return self.conn.execute(
             "SELECT * FROM faces WHERE image_id = ?", (image_id,)
         ).fetchall()
+
+    def get_face_count(self) -> int:
+        """获取人脸总数（轻量查询）"""
+        row = self.conn.execute("SELECT COUNT(*) FROM faces WHERE feature IS NOT NULL").fetchone()
+        return row[0] if row else 0
 
     def get_all_faces_with_features(self) -> list:
         """获取所有有特征向量的人脸，用于聚类"""
@@ -185,13 +228,28 @@ class DatabaseManager:
             "SELECT * FROM persons ORDER BY id"
         ).fetchall()
 
-    def get_faces_by_person(self, person_id: int) -> list:
+    def get_faces_by_person(self, person_id: int, limit: int = 0) -> list:
+        """获取某人物的所有人脸（可选 LIMIT）"""
+        if limit > 0:
+            return self.conn.execute(
+                "SELECT f.*, i.file_path, i.filename FROM faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "WHERE f.person_id = ? LIMIT ?",
+                (person_id, limit),
+            ).fetchall()
         return self.conn.execute(
             "SELECT f.*, i.file_path, i.filename FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE f.person_id = ?",
             (person_id,),
         ).fetchall()
+
+    def get_person_face_count(self, person_id: int) -> int:
+        """获取某人物的人脸总数（轻量查询）"""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM faces WHERE person_id = ?", (person_id,)
+        ).fetchone()
+        return row[0] if row else 0
 
     def update_person_name(self, person_id: int, name: str):
         self.conn.execute(
@@ -242,20 +300,22 @@ class DatabaseManager:
                        只清除未命名的人物归类
         """
         if keep_named:
-            # 只删除未命名的人物
-            unnamed_ids = self.conn.execute(
-                "SELECT id FROM persons WHERE name = '未命名'"
-            ).fetchall()
-            for row in unnamed_ids:
-                self.conn.execute(
-                    "UPDATE faces SET person_id = NULL WHERE person_id = ?",
-                    (row["id"],)
-                )
+            # 批量操作未命名的人物，避免逐行 DELETE
+            self.conn.execute(
+                "UPDATE faces SET person_id = NULL WHERE person_id IN "
+                "(SELECT id FROM persons WHERE name = '未命名')"
+            )
             self.conn.execute("DELETE FROM persons WHERE name = '未命名'")
         else:
             # 清除所有人物
             self.conn.execute("UPDATE faces SET person_id = NULL")
             self.conn.execute("DELETE FROM persons")
+        self._maybe_commit()
+
+    def delete_all_images(self):
+        """高效清空所有图片和关联数据"""
+        self.conn.execute("DELETE FROM faces")
+        self.conn.execute("DELETE FROM images")
         self._maybe_commit()
 
     # ---- Transaction ----

@@ -1,4 +1,11 @@
-"""主窗口 - 组装所有 UI 部件并协调业务逻辑"""
+"""主窗口 - 组装所有 UI 部件并协调业务逻辑（性能优化版）
+
+优化要点：
+1. DetectWorker 使用批量事务写入数据库，减少 commit 次数
+2. 检测时预生成缩略图缓存，PersonPanel 显示不再需要读原图
+3. 图片列表使用分页加载，避免万级数据一次性渲染
+4. 聚类前的预检查移到后台线程，避免阻塞 UI
+"""
 
 import os
 import threading
@@ -8,8 +15,9 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter,
     QToolBar, QListWidget, QListWidgetItem, QMessageBox,
     QFileDialog, QProgressDialog, QStatusBar, QLabel, QSlider,
+    QApplication,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QAction
 
 from ui import APP_NAME, APP_VERSION
@@ -18,6 +26,7 @@ from core.logger import get_logger, log_opencv_error, log_exception
 from core.database import DatabaseManager
 from core.face_engine import FaceEngine, FaceData, imread_unicode
 from core.face_cluster import FaceCluster
+from core.thumb_cache import ThumbCache
 from ui.image_viewer import ImageViewer
 from ui.face_list_panel import FaceListPanel
 from ui.person_panel import PersonPanel
@@ -25,23 +34,28 @@ from ui.person_panel import PersonPanel
 
 SUPPORTED_FORMATS = "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff *.webp)"
 
+# 图片列表每次加载的数量
+IMAGE_LIST_PAGE_SIZE = 500
+
 
 # ---- 后台工作线程 ----
 
 class DetectWorker(QThread):
-    """后台人脸检测+特征提取线程（多线程并行处理）"""
+    """后台人脸检测+特征提取线程（批量事务 + 缩略图预生成）"""
 
     progress = Signal(int, int, str)  # current, total, filename
     finished_all = Signal()
     error = Signal(str)
 
     def __init__(self, engine: FaceEngine, db: DatabaseManager, file_paths: list[str],
-                 base_folder: str = "", num_workers: int | None = None):
+                 base_folder: str = "", thumb_cache: ThumbCache | None = None,
+                 num_workers: int | None = None):
         super().__init__()
         self.engine = engine
         self.db = db
         self.file_paths = file_paths
         self.base_folder = base_folder
+        self.thumb_cache = thumb_cache
         # CUDA 时并行意义不大（GPU 内部已并行），CPU 时按核心数并行
         if num_workers is None:
             if engine.backend_name == "CUDA":
@@ -60,7 +74,7 @@ class DetectWorker(QThread):
         h, w = image.shape[:2]
         faces = engine.detect(image)
         engine.extract_features(image, faces)
-        
+
         # 计算相对路径
         relative_path = ""
         if self.base_folder:
@@ -69,29 +83,26 @@ class DetectWorker(QThread):
                 if relative_path == ".":
                     relative_path = ""
             except ValueError:
-                # 如果文件不在 base_folder 下，就不设置相对路径
                 relative_path = ""
-        
-        return fpath, os.path.basename(fpath), w, h, faces, relative_path
+
+        return fpath, os.path.basename(fpath), w, h, faces, relative_path, image
 
     def run(self):
         total = len(self.file_paths)
 
-        # 先在主线程（QThread）中预过滤已存在的图片，避免 worker 线程访问数据库
+        # 预过滤已存在的图片
         pending_paths = [p for p in self.file_paths if not self.db.image_exists(p)]
         skipped = total - len(pending_paths)
         if skipped > 0:
             get_logger().info(f"跳过 {skipped} 张已存在的图片")
 
-        # 每个工作线程需要独立的 engine 实例（detector 有状态）
-        # 使用 thread-local 确保每个线程独占自己的 engine，避免并发访问
+        # 多线程引擎
         _local = threading.local()
         engines = [self.engine.clone() for _ in range(self.num_workers)]
-        _engine_idx = [0]  # 分配计数器
+        _engine_idx = [0]
         _idx_lock = threading.Lock()
 
         def _get_thread_engine() -> FaceEngine:
-            """每个线程首次调用时分配一个独占的 engine 实例"""
             if not hasattr(_local, 'engine'):
                 with _idx_lock:
                     idx = _engine_idx[0]
@@ -99,40 +110,66 @@ class DetectWorker(QThread):
                 _local.engine = engines[idx]
             return _local.engine
 
-        counter = [0]  # 用列表以便在闭包中修改
+        counter = [0]
 
         def worker(idx: int, fpath: str):
             engine = _get_thread_engine()
             return self._process_one(engine, fpath)
 
-        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
-            futures = {
-                pool.submit(worker, i, fpath): fpath
-                for i, fpath in enumerate(pending_paths)
-            }
+        # ★ 使用批量事务提交，大幅减少 I/O
+        BATCH_COMMIT_SIZE = 50
+        uncommitted = 0
+        self.db.begin()
 
-            for future in as_completed(futures):
-                fpath = futures[future]
-                counter[0] += 1
-                self.progress.emit(skipped + counter[0], total, os.path.basename(fpath))
+        try:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                futures = {
+                    pool.submit(worker, i, fpath): fpath
+                    for i, fpath in enumerate(pending_paths)
+                }
 
-                try:
-                    result = future.result()
-                    if result is None:
-                        continue
+                for future in as_completed(futures):
+                    fpath = futures[future]
+                    counter[0] += 1
+                    self.progress.emit(skipped + counter[0], total, os.path.basename(fpath))
 
-                    fpath, filename, w, h, faces, relative_path = result
-                    # 所有 DB 操作都在 QThread 的 run() 中顺序执行，无需加锁
-                    image_id = self.db.add_image(fpath, filename, w, h, len(faces), relative_path)
-                    for face in faces:
-                        self.db.add_face(
-                            image_id, face.bbox, face.landmarks,
-                            face.score, face.feature,
-                        )
-                except Exception as e:
-                    logger = get_logger()
-                    log_opencv_error("DetectWorker._process_one", e, suppress=True)
-                    self.error.emit(f"{os.path.basename(fpath)}: {e}")
+                    try:
+                        result = future.result()
+                        if result is None:
+                            continue
+
+                        fpath, filename, w, h, faces, relative_path, image = result
+
+                        # 写入图片记录
+                        image_id = self.db.add_image(fpath, filename, w, h, len(faces), relative_path)
+
+                        # 批量写入人脸记录 + 预生成缩略图
+                        for face in faces:
+                            face_id = self.db.add_face(
+                                image_id, face.bbox, face.landmarks,
+                                face.score, face.feature,
+                            )
+                            # ★ 预生成缩略图缓存
+                            if self.thumb_cache and image is not None:
+                                self.thumb_cache.save_from_image(face_id, image, face.bbox)
+
+                        del image  # 尽早释放大图内存
+
+                        uncommitted += 1
+                        if uncommitted >= BATCH_COMMIT_SIZE:
+                            self.db.commit()
+                            self.db.begin()
+                            uncommitted = 0
+
+                    except Exception as e:
+                        log_opencv_error("DetectWorker._process_one", e, suppress=True)
+                        self.error.emit(f"{os.path.basename(fpath)}: {e}")
+
+            # 提交剩余数据
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
         self.finished_all.emit()
 
@@ -173,14 +210,20 @@ class MainWindow(QMainWindow):
         self._current_image_id: int | None = None
         self._worker: QThread | None = None
 
+        # ★ 初始化缩略图缓存
+        thumb_dir = os.path.join(config.data_dir, "thumb_cache")
+        self._thumb_cache = ThumbCache(thumb_dir)
+
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1280, 800)
 
         self._build_toolbar()
         self._build_ui()
         self._build_statusbar()
-        self._load_image_list()
-        
+
+        # ★ 延迟加载：窗口显示后再加载数据，避免启动卡顿
+        QTimer.singleShot(0, self._load_image_list)
+
         self.logger.info("主窗口初始化完成")
 
     # ---- 构建 UI ----
@@ -215,21 +258,20 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_clear)
 
         tb.addSeparator()
-        
-        # 设置数据目录按钮
+
         self._act_set_cache = QAction("设置数据目录", self)
         self._act_set_cache.triggered.connect(self._on_set_cache_dir)
         tb.addAction(self._act_set_cache)
 
         tb.addSeparator()
 
-        # 聚类阈值滑块（0.20 ~ 0.60，默认 0.363）
+        # 聚类阈值滑块
         thresh_label = QLabel("聚类阈值:")
         thresh_label.setStyleSheet("padding: 0 4px;")
         tb.addWidget(thresh_label)
         self._thresh_slider = QSlider(Qt.Orientation.Horizontal)
-        self._thresh_slider.setRange(20, 60)  # 实际值 = slider / 100
-        self._thresh_slider.setValue(36)       # 0.36
+        self._thresh_slider.setRange(20, 60)
+        self._thresh_slider.setValue(36)
         self._thresh_slider.setFixedWidth(120)
         self._thresh_slider.setToolTip("调整人脸聚类的余弦相似度阈值\n值越高→分类越严格，人物组越多\n值越低→分类越宽松，更容易合并")
         tb.addWidget(self._thresh_slider)
@@ -273,17 +315,17 @@ class MainWindow(QMainWindow):
         bottom_splitter.addWidget(image_list_container)
 
         # 人脸列表
-        self._face_panel = FaceListPanel()
+        self._face_panel = FaceListPanel(thumb_cache=self._thumb_cache)
         bottom_splitter.addWidget(self._face_panel)
 
-        # 人物归类
-        self._person_panel = PersonPanel(self.db)
+        # 人物归类（传入缩略图缓存）
+        self._person_panel = PersonPanel(self.db, thumb_cache=self._thumb_cache)
         self._person_panel.navigate_to_image.connect(self._navigate_to_image)
         bottom_splitter.addWidget(self._person_panel)
 
         bottom_splitter.setStretchFactor(0, 1)
         bottom_splitter.setStretchFactor(1, 1)
-        bottom_splitter.setStretchFactor(2, 1)
+        bottom_splitter.setStretchFactor(2, 2)  # ★ 人物面板更宽，减少挤压
 
         # 主分割器（上下）
         main_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -302,19 +344,36 @@ class MainWindow(QMainWindow):
     # ---- 数据加载 ----
 
     def _load_image_list(self):
-        """从数据库加载图片列表"""
+        """从数据库加载图片列表（分批加载避免卡顿）"""
         self._image_list.clear()
-        for row in self.db.get_all_images():
-            # 如果有相对路径信息，显示在文件名前面
-            display_name = row['filename']
-            if row['relative_path']:
-                display_name = f"{row['relative_path']}/{row['filename']}"
-            item = QListWidgetItem(f"{display_name}  [{row['face_count']} 人脸]")
-            item.setData(Qt.ItemDataRole.UserRole, row["id"])
-            self._image_list.addItem(item)
-        
-        # 同时加载人物归类数据
+
+        # ★ 分批加载：每批 PAGE_SIZE 条，避免一次性创建万级 QListWidgetItem
+        offset = 0
+        total_loaded = 0
+        while True:
+            rows = self.db.get_images_paginated(offset, IMAGE_LIST_PAGE_SIZE)
+            if not rows:
+                break
+            for row in rows:
+                display_name = row['filename']
+                if row['relative_path']:
+                    display_name = f"{row['relative_path']}/{row['filename']}"
+                item = QListWidgetItem(f"{display_name}  [{row['face_count']} 人脸]")
+                item.setData(Qt.ItemDataRole.UserRole, row["id"])
+                self._image_list.addItem(item)
+            total_loaded += len(rows)
+            offset += IMAGE_LIST_PAGE_SIZE
+
+            # 每批之间让 UI 呼吸一下
+            if total_loaded % 2000 == 0:
+                QApplication.processEvents()
+
+        # 加载人物归类数据
         self._person_panel.refresh()
+
+        image_count = self.db.get_image_count()
+        if image_count > 0:
+            self._statusbar.showMessage(f"已加载 {image_count} 张图片")
 
     def _show_image(self, image_id: int):
         """显示选中图片的原始图 + 识别结果图"""
@@ -386,7 +445,6 @@ class MainWindow(QMainWindow):
         self.logger.info(f"用户选择导入文件夹: {folder}")
         exts = FaceEngine.SUPPORTED_FORMATS
         paths = []
-        # 递归扫描所有子文件夹
         for root, dirs, files in os.walk(folder):
             for f in files:
                 if os.path.splitext(f)[1].lower() in exts:
@@ -399,40 +457,40 @@ class MainWindow(QMainWindow):
         self._run_detect(paths, folder)
 
     def _on_detect_all(self):
-        """对数据库中所有未识别的图片重新识别（清空旧数据后重新导入）"""
+        """对数据库中所有未识别的图片重新识别"""
         images = self.db.get_all_images()
         if not images:
             QMessageBox.information(self, "提示", "请先导入图片。")
             return
         self.logger.info(f"开始重新识别 {len(images)} 张图片")
         paths = [row["file_path"] for row in images]
-        # 清空旧人脸数据，重新检测（faces 会级联删除）
-        for row in images:
-            self.db.delete_image(row["id"])
+        # ★ 批量清空（替代逐条删除）
+        self.db.delete_all_images()
+        # 清除缩略图缓存
+        self._thumb_cache.clear()
         self._run_detect(paths)
 
     def _on_cluster(self):
-        faces = self.db.get_all_faces_with_features()
-        if not faces:
+        # ★ 使用轻量计数查询替代加载全部数据
+        face_count = self.db.get_face_count()
+        if face_count == 0:
             QMessageBox.information(self, "提示", "没有可用的人脸特征数据，请先导入并识别图片。")
             return
 
         threshold = self._thresh_slider.value() / 100.0
-        self.logger.info(f"开始人脸聚类，阈值={threshold:.2f}，共 {len(faces)} 张人脸")
+        self.logger.info(f"开始人脸聚类，阈值={threshold:.2f}，共 {face_count} 张人脸")
 
         self._statusbar.showMessage("正在进行人脸归类...")
         self._set_actions_enabled(False)
 
-        n = len(faces)
         self._cluster_progress = QProgressDialog(
-            f"正在归类 {n} 张人脸（阈值 {threshold:.2f}）...", None, 0, 100, self
+            f"正在归类 {face_count} 张人脸（阈值 {threshold:.2f}）...", None, 0, 100, self
         )
         self._cluster_progress.setWindowTitle("人脸归类")
         self._cluster_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._cluster_progress.setMinimumDuration(0)
         self._cluster_progress.setValue(0)
 
-        # 使用增量聚类模式（保留已命名的人物）
         worker = ClusterWorker(self.cluster_engine, threshold, incremental=True)
         worker.progress.connect(self._on_cluster_progress)
         worker.finished_cluster.connect(self._on_cluster_done)
@@ -453,8 +511,9 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.StandardButton.Yes:
             self.logger.warning("用户执行清空所有数据操作")
             self.db.clear_all_persons()
-            for row in self.db.get_all_images():
-                self.db.delete_image(row["id"])
+            # ★ 批量清空替代逐条删除
+            self.db.delete_all_images()
+            self._thumb_cache.clear()
             self._image_list.clear()
             self._original_viewer.clear_image()
             self._result_viewer.clear_image()
@@ -462,23 +521,23 @@ class MainWindow(QMainWindow):
             self._person_panel.refresh()
             self._statusbar.showMessage("数据已清空")
             self.logger.info("数据清空完成")
-    
+
     def _on_set_cache_dir(self):
         """设置数据目录"""
         from ui.data_dir_dialog import DataDirDialog
-        
+
         dlg = DataDirDialog(self.config, self)
         if dlg.exec() != DataDirDialog.DialogCode.Accepted:
             return
-        
-        new_dir = dlg.get_selected_dir()  # None = 使用默认
+
+        new_dir = dlg.get_selected_dir()
         effective_new = new_dir if new_dir else self.config.default_data_dir
         current_dir = self.config.data_dir
-        
+
         if os.path.normpath(effective_new) == os.path.normpath(current_dir):
             QMessageBox.information(self, "提示", "数据目录未改变")
             return
-        
+
         self.logger.info(f"用户更改数据目录: {current_dir} -> {effective_new}")
         try:
             self.config.set_data_dir(new_dir)
@@ -507,7 +566,9 @@ class MainWindow(QMainWindow):
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(0)
 
-        worker = DetectWorker(self.engine, self.db, paths, base_folder)
+        # ★ 传入缩略图缓存，检测时自动预生成
+        worker = DetectWorker(self.engine, self.db, paths, base_folder,
+                              thumb_cache=self._thumb_cache)
         worker.progress.connect(self._on_detect_progress)
         worker.finished_all.connect(self._on_detect_done)
         worker.error.connect(lambda msg: self._statusbar.showMessage(f"错误: {msg}"))
@@ -526,7 +587,6 @@ class MainWindow(QMainWindow):
         total_images = self._image_list.count()
         self._statusbar.showMessage(f"检测完成，共 {total_images} 张图片")
 
-        # 自动选中第一张
         if total_images > 0:
             self._image_list.setCurrentRow(0)
 
@@ -539,7 +599,6 @@ class MainWindow(QMainWindow):
         self._statusbar.showMessage(f"归类完成: {face_count} 张人脸归为 {person_count} 个人物")
         self._person_panel.refresh()
 
-        # 刷新当前图片显示（更新 person_id 标注）
         if self._current_image_id is not None:
             self._show_image(self._current_image_id)
 

@@ -1,4 +1,7 @@
-"""当前图片的人脸列表面板"""
+"""当前图片的人脸列表面板（性能优化版）
+
+优化：优先从缩略图缓存加载，避免每次都从完整图像裁剪。
+"""
 
 import cv2
 import numpy as np
@@ -9,12 +12,13 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt, Signal
 
 from core.face_engine import FaceEngine
+from core.thumb_cache import ThumbCache
 
 
 class FaceCard(QFrame):
     """单个人脸卡片"""
 
-    def __init__(self, face_thumb: np.ndarray, index: int, score: float,
+    def __init__(self, pix: QPixmap, index: int, score: float,
                  person_id: int | None = None, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -28,7 +32,6 @@ class FaceCard(QFrame):
         # 缩略图
         thumb_label = QLabel()
         thumb_label.setFixedSize(64, 64)
-        pix = self._cv_to_pixmap(face_thumb, 64, 64)
         thumb_label.setPixmap(pix)
         thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(thumb_label)
@@ -43,16 +46,16 @@ class FaceCard(QFrame):
         layout.addLayout(info_layout)
         layout.addStretch()
 
-    @staticmethod
-    def _cv_to_pixmap(cv_img: np.ndarray, w: int, h: int) -> QPixmap:
-        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        ih, iw, ch = rgb.shape
-        qimg = QImage(rgb.data, iw, ih, ch * iw, QImage.Format.Format_RGB888)
-        return QPixmap.fromImage(qimg).scaled(
-            w, h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+
+def _cv_to_pixmap(cv_img: np.ndarray, w: int, h: int) -> QPixmap:
+    rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+    ih, iw, ch = rgb.shape
+    qimg = QImage(rgb.data, iw, ih, ch * iw, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg).scaled(
+        w, h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 class FaceListPanel(QWidget):
@@ -60,8 +63,10 @@ class FaceListPanel(QWidget):
 
     face_selected = Signal(int)  # 发射人脸索引
 
-    def __init__(self, parent=None):
+    def __init__(self, thumb_cache: ThumbCache | None = None, parent=None):
         super().__init__(parent)
+        self._thumb_cache = thumb_cache
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
@@ -91,7 +96,7 @@ class FaceListPanel(QWidget):
         # 清空
         while self._container_layout.count():
             item = self._container_layout.takeAt(0)
-            if item.widget():
+            if item and item.widget():
                 item.widget().deleteLater()
 
         if cv_image is None or not faces_data:
@@ -102,7 +107,18 @@ class FaceListPanel(QWidget):
             return
 
         for idx, fd in enumerate(faces_data):
+            face_id = fd.get("id")
             bbox = (fd["bbox_x"], fd["bbox_y"], fd["bbox_w"], fd["bbox_h"])
-            thumb = FaceEngine.crop_face(cv_image, bbox)
-            card = FaceCard(thumb, idx, fd["score"], fd.get("person_id"))
+
+            # ★ 优先从缩略图缓存加载
+            pix = None
+            if self._thumb_cache and face_id:
+                pix = self._thumb_cache.get_pixmap(face_id, 64, 64)
+
+            if pix is None:
+                # 兜底：从完整图像裁剪
+                thumb = FaceEngine.crop_face(cv_image, bbox)
+                pix = _cv_to_pixmap(thumb, 64, 64)
+
+            card = FaceCard(pix, idx, fd["score"], fd.get("person_id"))
             self._container_layout.addWidget(card)
