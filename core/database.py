@@ -71,6 +71,7 @@ class DatabaseManager:
                 score REAL,
                 feature BLOB,
                 person_id INTEGER,
+                blur_score REAL DEFAULT 0,
                 FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE,
                 FOREIGN KEY (person_id) REFERENCES persons(id) ON DELETE SET NULL
             );
@@ -85,12 +86,17 @@ class DatabaseManager:
 
     def _migrate(self):
         """数据库迁移：为旧版数据库添加缺失的列"""
-        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(images)").fetchall()}
-        if "analyzed" not in columns:
+        img_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(images)").fetchall()}
+        if "analyzed" not in img_columns:
             self.logger.info("数据库迁移：添加 analyzed 列")
             self.conn.execute("ALTER TABLE images ADD COLUMN analyzed INTEGER DEFAULT 0")
-            # 旧数据库中已有的图片视为已分析
             self.conn.execute("UPDATE images SET analyzed = 1")
+            self.conn.commit()
+
+        face_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(faces)").fetchall()}
+        if "blur_score" not in face_columns:
+            self.logger.info("数据库迁移：添加 blur_score 列")
+            self.conn.execute("ALTER TABLE faces ADD COLUMN blur_score REAL DEFAULT 0")
             self.conn.commit()
 
     # ---- Images ----
@@ -182,13 +188,14 @@ class DatabaseManager:
         score: float,
         feature: Optional[np.ndarray] = None,
         person_id: Optional[int] = None,
+        blur_score: float = 0.0,
     ) -> int:
         feature_blob = feature.tobytes() if feature is not None else None
         landmarks_json = json.dumps(landmarks)
         cur = self.conn.execute(
-            "INSERT INTO faces (image_id, bbox_x, bbox_y, bbox_w, bbox_h, landmarks, score, feature, person_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (image_id, bbox[0], bbox[1], bbox[2], bbox[3], landmarks_json, score, feature_blob, person_id),
+            "INSERT INTO faces (image_id, bbox_x, bbox_y, bbox_w, bbox_h, landmarks, score, feature, person_id, blur_score) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (image_id, bbox[0], bbox[1], bbox[2], bbox[3], landmarks_json, score, feature_blob, person_id, blur_score),
         )
         self._maybe_commit()
         return cur.lastrowid
@@ -236,6 +243,17 @@ class DatabaseManager:
             "UPDATE faces SET person_id = ? WHERE id = ?", updates
         )
         self._maybe_commit()
+
+    def delete_faces_by_image(self, image_id: int) -> list[int]:
+        """删除指定图片的所有人脸数据，返回被删除的 face_id 列表"""
+        rows = self.conn.execute(
+            "SELECT id FROM faces WHERE image_id = ?", (image_id,)
+        ).fetchall()
+        face_ids = [row[0] for row in rows]
+        if face_ids:
+            self.conn.execute("DELETE FROM faces WHERE image_id = ?", (image_id,))
+            self._maybe_commit()
+        return face_ids
 
     def get_face(self, face_id: int):
         return self.conn.execute(
