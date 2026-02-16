@@ -55,10 +55,12 @@ class DetectWorker(QThread):
     def __init__(self, engine: FaceEngine, db: DatabaseManager,
                  image_items: list[tuple[int, str]],
                  thumb_cache: ThumbCache | None = None,
-                 num_workers: int | None = None):
+                 num_workers: int | None = None,
+                 blur_threshold: float = 0.0):
         """
         Args:
             image_items: [(image_id, file_path), ...] 待检测的图片列表
+            blur_threshold: 模糊度阈值，低于此值的人脸将被丢弃。0 表示不过滤。
         """
         super().__init__()
         self.logger = get_logger()
@@ -66,6 +68,7 @@ class DetectWorker(QThread):
         self.db = db
         self.image_items = image_items
         self.thumb_cache = thumb_cache
+        self.blur_threshold = blur_threshold
         if num_workers is None:
             if engine.backend_name == "CUDA":
                 self.num_workers = 1
@@ -73,7 +76,7 @@ class DetectWorker(QThread):
                 self.num_workers = min(os.cpu_count() or 4, 4)
         else:
             self.num_workers = num_workers
-        self.logger.info(f"DetectWorker: {len(image_items)} 张待检测，线程数: {self.num_workers}")
+        self.logger.info(f"DetectWorker: {len(image_items)} 张待检测，线程数: {self.num_workers}，模糊阈值: {self.blur_threshold}")
 
     def _process_one(self, engine: FaceEngine, fpath: str):
         """在 worker 线程中处理单张图片，返回轻量结果（不含完整图像）"""
@@ -83,6 +86,22 @@ class DetectWorker(QThread):
 
         h, w = image.shape[:2]
         faces = engine.detect(image)
+
+        # ★ 模糊度检测：在特征提取之前过滤，节省计算量
+        if self.blur_threshold > 0:
+            filtered = []
+            for face in faces:
+                crop = FaceEngine.crop_face(image, face.bbox)
+                face.blur_score = FaceEngine.compute_blur_score(crop)
+                if face.blur_score >= self.blur_threshold:
+                    filtered.append(face)
+            faces = filtered
+        else:
+            # 即使不过滤也计算分数，用于 UI 显示
+            for face in faces:
+                crop = FaceEngine.crop_face(image, face.bbox)
+                face.blur_score = FaceEngine.compute_blur_score(crop)
+
         engine.extract_features(image, faces)
 
         # ★ 在 worker 线程中裁剪+编码缩略图（几 KB），不传回完整图像（几 MB）
@@ -159,6 +178,7 @@ class DetectWorker(QThread):
                                     face_id = self.db.add_face(
                                         image_id, face.bbox, face.landmarks,
                                         face.score, face.feature,
+                                        blur_score=face.blur_score,
                                     )
                                     # 写入预编码的缩略图
                                     if self.thumb_cache and i < len(thumb_data) and thumb_data[i]:
@@ -267,6 +287,11 @@ class MainWindow(QMainWindow):
         self._act_detect.triggered.connect(self._on_detect)
         tb.addAction(self._act_detect)
 
+        self._act_redetect = QAction("重新识别当前图片", self)
+        self._act_redetect.setToolTip("删除当前图片的旧识别结果，重新进行人脸检测")
+        self._act_redetect.triggered.connect(self._on_redetect_current)
+        tb.addAction(self._act_redetect)
+
         self._act_cluster = QAction("人脸归类", self)
         self._act_cluster.triggered.connect(self._on_cluster)
         tb.addAction(self._act_cluster)
@@ -302,6 +327,30 @@ class MainWindow(QMainWindow):
         self._thresh_slider.valueChanged.connect(
             lambda v: self._thresh_value_label.setText(f"{v / 100:.2f}")
         )
+
+        tb.addSeparator()
+
+        # 模糊度阈值滑块
+        blur_label = QLabel("清晰度阈值:")
+        blur_label.setStyleSheet("padding: 0 4px;")
+        tb.addWidget(blur_label)
+        self._blur_slider = QSlider(Qt.Orientation.Horizontal)
+        self._blur_slider.setRange(0, 100)
+        self._blur_slider.setValue(0)
+        self._blur_slider.setFixedWidth(120)
+        self._blur_slider.setToolTip(
+            "人脸清晰度过滤阈值（多指标融合评分 0-100）\n"
+            "低于此值的模糊人脸将被丢弃\n"
+            "0 = 不过滤（保留所有人脸）\n"
+            "参考：< 15 严重模糊  |  15-40 模糊但可辨认  |  > 40 清晰\n"
+            "算法：Laplacian + Tenengrad(Sobel) + FFT高频占比 加权融合"
+        )
+        tb.addWidget(self._blur_slider)
+        self._blur_value_label = QLabel("关闭")
+        self._blur_value_label.setFixedWidth(36)
+        self._blur_value_label.setStyleSheet("padding: 0 4px;")
+        tb.addWidget(self._blur_value_label)
+        self._blur_slider.valueChanged.connect(self._on_blur_slider_changed)
 
     def _build_ui(self):
         central = QWidget()
@@ -469,6 +518,9 @@ class MainWindow(QMainWindow):
 
     # ---- 工具栏回调 ----
 
+    def _on_blur_slider_changed(self, value: int):
+        self._blur_value_label.setText("关闭" if value == 0 else str(value))
+
     def _on_image_selected(self, current: QListWidgetItem, _previous=None):
         if current is None:
             return
@@ -570,9 +622,11 @@ class MainWindow(QMainWindow):
         # 构建 (image_id, file_path) 列表
         items = [(row["id"], row["file_path"]) for row in unanalyzed]
 
+        blur_threshold = self._blur_slider.value()
         worker = DetectWorker(
             self.engine, self.db, items,
             thumb_cache=self._thumb_cache,
+            blur_threshold=float(blur_threshold),
         )
         worker.progress.connect(self._on_detect_progress)
         worker.finished_all.connect(self._on_detect_done)
@@ -592,6 +646,88 @@ class MainWindow(QMainWindow):
 
         if self._image_list.count() > 0 and self._current_image_id is None:
             self._image_list.setCurrentRow(0)
+
+    # ---- 重新识别当前图片 ----
+
+    def _on_redetect_current(self):
+        """删除当前图片的旧识别结果，重新进行人脸检测"""
+        if self._current_image_id is None:
+            QMessageBox.information(self, "提示", "请先选择一张图片。")
+            return
+
+        image_id = self._current_image_id
+        img_row = self.db.get_image(image_id)
+        if img_row is None:
+            QMessageBox.warning(self, "错误", "找不到该图片记录。")
+            return
+
+        fpath = img_row["file_path"]
+        self._statusbar.showMessage(f"正在重新识别: {os.path.basename(fpath)}...")
+        QApplication.processEvents()
+
+        # 读取图像
+        cv_img = imread_unicode(fpath)
+        if cv_img is None:
+            QMessageBox.warning(self, "错误", f"无法读取图片:\n{fpath}")
+            return
+
+        # 删除旧的人脸数据及缩略图缓存
+        old_face_ids = self.db.delete_faces_by_image(image_id)
+        for fid in old_face_ids:
+            self._thumb_cache.invalidate(fid)
+
+        # 人脸检测
+        h, w = cv_img.shape[:2]
+        faces = self.engine.detect(cv_img)
+
+        # 模糊度检测与过滤
+        blur_threshold = self._blur_slider.value()
+        discarded = 0
+        for face in faces:
+            crop = FaceEngine.crop_face(cv_img, face.bbox)
+            face.blur_score = FaceEngine.compute_blur_score(crop)
+
+        if blur_threshold > 0:
+            before_count = len(faces)
+            faces = [f for f in faces if f.blur_score >= blur_threshold]
+            discarded = before_count - len(faces)
+
+        # 特征提取（仅对通过模糊度过滤的人脸）
+        self.engine.extract_features(cv_img, faces)
+
+        # 保存到数据库
+        for face in faces:
+            face_id = self.db.add_face(
+                image_id, face.bbox, face.landmarks,
+                face.score, face.feature,
+                blur_score=face.blur_score,
+            )
+            # 生成缩略图缓存
+            if self._thumb_cache:
+                self._thumb_cache.save_from_image(face_id, cv_img, face.bbox)
+
+        # 标记为已分析
+        self.db.mark_image_analyzed(image_id, w, h, len(faces))
+
+        # 刷新显示
+        self._show_image(image_id)
+
+        # 更新图片列表中的当前条目
+        current_item = self._image_list.currentItem()
+        if current_item:
+            display_name = img_row['filename']
+            if img_row['relative_path']:
+                display_name = f"{img_row['relative_path']}/{img_row['filename']}"
+            label = f"{display_name}  [{len(faces)} 人脸]"
+            current_item.setText(label)
+            current_item.setForeground(Qt.GlobalColor.white)
+
+        msg = f"重新识别完成: 检测到 {len(faces)} 张人脸"
+        if discarded > 0:
+            msg += f"（已过滤 {discarded} 张模糊人脸）"
+        self._statusbar.showMessage(msg)
+        self.logger.info(f"重新识别图片 {image_id}: {len(faces)} 张人脸, 过滤 {discarded} 张模糊")
+        self._update_statusbar_stats()
 
     # ---- 聚类 ----
 
@@ -693,5 +829,6 @@ class MainWindow(QMainWindow):
         self._act_import_images.setEnabled(enabled)
         self._act_import_folder.setEnabled(enabled)
         self._act_detect.setEnabled(enabled)
+        self._act_redetect.setEnabled(enabled)
         self._act_cluster.setEnabled(enabled)
         self._act_clear.setEnabled(enabled)

@@ -17,6 +17,7 @@ class FaceData:
     landmarks: list  # 5 个关键点 [(x,y), ...]
     score: float
     feature: Optional[np.ndarray] = field(default=None, repr=False)
+    blur_score: float = 0.0  # 清晰度分数（Laplacian 方差），越高越清晰
 
     def to_detect_array(self) -> np.ndarray:
         flat_landmarks = [coord for pt in self.landmarks for coord in pt]
@@ -341,6 +342,75 @@ class FaceEngine:
         cv2.putText(result, f"Faces: {len(faces)}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
         return result
+
+    @staticmethod
+    def compute_blur_score(crop: np.ndarray) -> float:
+        """计算人脸清晰度质量分数（多指标融合）
+
+        融合三种互补的图像质量指标，能够区分「模糊但面部特征可辨」
+        与「严重模糊导致特征失真」两种情况：
+
+        1. Laplacian 方差 — 整体边缘响应强度
+        2. Tenengrad (Sobel 梯度均值) — 对结构性边缘更敏感，
+           能反映面部轮廓（眉眼鼻嘴）是否完整保留
+        3. FFT 高频能量占比 — 区分模糊程度的关键：
+           轻度模糊仍保留中高频结构信息，严重模糊几乎只剩低频
+
+        三项指标经 sigmoid 归一化后加权融合，输出 0-100 分。
+
+        Args:
+            crop: 人脸裁剪区域（BGR 或灰度）
+
+        Returns:
+            质量分数 0-100，越高越清晰
+            参考：< 15 严重模糊（建议丢弃），15-40 模糊但可辨认，> 40 清晰
+        """
+        if crop is None or crop.size == 0:
+            return 0.0
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        h, w = gray.shape
+        if h < 10 or w < 10:
+            return 0.0
+
+        # ---- 指标 1: Laplacian 方差 ----
+        laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+        # ---- 指标 2: Tenengrad (Sobel 梯度幅度均值) ----
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        tenengrad = float(np.sqrt(gx * gx + gy * gy).mean())
+
+        # ---- 指标 3: FFT 高频能量占比 ----
+        f = np.fft.fft2(gray.astype(np.float64))
+        fshift = np.fft.fftshift(f)
+        magnitude = np.abs(fshift)
+        cy, cx = h // 2, w // 2
+        # 高频定义：距频谱中心 > 1/3 短边的区域
+        radius = min(h, w) / 3.0
+        Y, X = np.ogrid[:h, :w]
+        dist_sq = (X - cx) ** 2 + (Y - cy) ** 2
+        radius_sq = radius * radius
+        total_energy = float(magnitude.sum()) + 1e-10
+        high_freq_energy = float(magnitude[dist_sq > radius_sq].sum())
+        hf_ratio = high_freq_energy / total_energy
+
+        # ---- sigmoid 归一化 → 0-1 ----
+        def _sigmoid(x: float, center: float, scale: float) -> float:
+            z = -(x - center) / max(scale, 1e-8)
+            if z > 30:
+                return 0.0
+            if z < -30:
+                return 1.0
+            return 1.0 / (1.0 + np.exp(z))
+
+        lap_score = _sigmoid(laplacian_var, 80, 40)
+        ten_score = _sigmoid(tenengrad, 25, 12)
+        hf_score = _sigmoid(hf_ratio, 0.35, 0.08)
+
+        # 加权融合：FFT 权重最高，因为它对区分两种模糊最有效
+        quality = (lap_score * 0.25 + ten_score * 0.35 + hf_score * 0.40) * 100
+        return round(quality, 1)
 
     @staticmethod
     def crop_face(image: np.ndarray, bbox: tuple, padding: float = 0.2) -> np.ndarray:

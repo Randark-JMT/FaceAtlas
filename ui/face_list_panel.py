@@ -19,7 +19,8 @@ class FaceCard(QFrame):
     """单个人脸卡片"""
 
     def __init__(self, pix: QPixmap, index: int, score: float,
-                 person_id: int | None = None, parent=None):
+                 person_id: int | None = None, blur_score: float = 0.0,
+                 parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(
@@ -43,6 +44,17 @@ class FaceCard(QFrame):
         info_layout.addWidget(QLabel(f"置信度: {score:.3f}"))
         person_text = f"人物: P{person_id}" if person_id is not None else "人物: 未归类"
         info_layout.addWidget(QLabel(person_text))
+
+        # 清晰度分数（颜色编码，0-100 评分）
+        blur_label = QLabel(f"清晰度: {blur_score:.1f}")
+        if blur_score >= 40:
+            blur_label.setStyleSheet("color: #4caf50;")  # 绿色 - 清晰
+        elif blur_score >= 15:
+            blur_label.setStyleSheet("color: #ff9800;")  # 橙色 - 模糊但可辨认
+        else:
+            blur_label.setStyleSheet("color: #f44336;")  # 红色 - 严重模糊
+        info_layout.addWidget(blur_label)
+
         layout.addLayout(info_layout)
         layout.addStretch()
 
@@ -120,5 +132,6 @@ class FaceListPanel(QWidget):
                 thumb = FaceEngine.crop_face(cv_image, bbox)
                 pix = _cv_to_pixmap(thumb, 64, 64)
 
-            card = FaceCard(pix, idx, fd["score"], fd.get("person_id"))
+            card = FaceCard(pix, idx, fd["score"], fd.get("person_id"),
+                           blur_score=fd.get("blur_score", 0.0))
             self._container_layout.addWidget(card)
