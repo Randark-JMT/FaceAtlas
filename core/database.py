@@ -340,6 +340,8 @@ class DatabaseManager:
         else:
             self.conn.execute("UPDATE faces SET person_id = NULL")
             self.conn.execute("DELETE FROM persons")
+            # 重置自增计数器，使新的 person_id 从 1 开始
+            self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'persons'")
         self._maybe_commit()
 
     def delete_all_images(self):
