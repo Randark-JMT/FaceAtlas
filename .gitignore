@@ -1,9 +1,22 @@
-FaceAtlas.db
+# Python Environment    
 **/__pycache__/
-dist/
-build/
-
 .venv*/
 
+# Build
 build/
+dist/
+
+# Database
+FaceAtlas.db
+
+# Log
 FaceAtlas.log
+
+# CMake
+*.cmake
+etc/
+include/
+x64/
+bin/
+java/
+setup_vars_opencv4.cmd
