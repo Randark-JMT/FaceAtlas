@@ -17,7 +17,9 @@
 以下数据测试自作者本人笔记本，仅供参考
 
 > 数据集：某平台新闻图片集（32190张图片 | 156GB）
+>
 > 硬件平台：i7-13620H | 64G RAM | RTX 4060 Laptop
+>
 > 基础环境信息：Windows 11 25H2 | Nvidia Driver Version: 591.86 | CUDA Version: 13.1
 
 ## In the future
