@@ -255,7 +255,7 @@ class MainWindow(QMainWindow):
         self._thumb_cache = ThumbCache(thumb_dir)
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.resize(1280, 800)
+        self.resize(1440, 800)
 
         self._build_toolbar()
         self._build_ui()
