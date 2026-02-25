@@ -4,7 +4,9 @@
 
 ## 核心特性
 
-- 基于 OpenCV 实现的图像识别模型
+- 基于 Pytorch 所运行的图像识别模型
+    - 人脸检测：MTCNN
+    - 人脸识别：InceptionResnetV1
 - 基于多指标（Laplacian 方差，Tenengrad 梯度、FFT）所实现的多指标融合的清晰度评估算法
 - 支持单张图像中多人脸的检测与识别
 - 基于人脸结构特征向量所构建的聚类分析算法
@@ -28,5 +30,6 @@
 
 - [x] CUDA 加入多线程并行计算
 - [x] 迁移至 Postgres 数据库，支持大型数据集
+- [x] 从 OpenCV 迁移至 Pytorch 并使用 facenet-pytorch 框架
 - [ ] 加入面部角度识别模型
 - [ ] 加入线程动态调整
