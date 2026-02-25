@@ -5,3 +5,4 @@ pyinstaller
 rich
 nuitka
 zstandard
+psycopg2-binary

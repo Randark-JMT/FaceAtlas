@@ -251,8 +251,7 @@ class MainWindow(QMainWindow):
         self._worker: QThread | None = None
 
         # 缩略图缓存
-        thumb_dir = os.path.join(config.data_dir, "thumb_cache")
-        self._thumb_cache = ThumbCache(thumb_dir)
+        self._thumb_cache = ThumbCache(config.thumb_cache_dir)
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1440, 800)
@@ -305,9 +304,9 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._act_set_cache = QAction("设置数据目录", self)
-        self._act_set_cache.triggered.connect(self._on_set_cache_dir)
-        tb.addAction(self._act_set_cache)
+        self._act_switch_db = QAction("切换数据库连接", self)
+        self._act_switch_db.triggered.connect(self._on_switch_database)
+        tb.addAction(self._act_switch_db)
 
         tb.addSeparator()
 
@@ -797,34 +796,38 @@ class MainWindow(QMainWindow):
             self._statusbar.showMessage("数据已清空")
             self.logger.info("数据清空完成")
 
-    def _on_set_cache_dir(self):
-        from ui.data_dir_dialog import DataDirDialog
+    def _on_switch_database(self):
+        from ui.pg_connect_dialog import PgConnectDialog
 
-        dlg = DataDirDialog(self.config, self)
-        if dlg.exec() != DataDirDialog.DialogCode.Accepted:
+        old_display = self.config.database_display
+        dlg = PgConnectDialog(self.config, self)
+        if dlg.exec() != PgConnectDialog.DialogCode.Accepted:
             return
 
-        new_dir = dlg.get_selected_dir()
-        effective_new = new_dir if new_dir else self.config.default_data_dir
-        current_dir = self.config.data_dir
-
-        if os.path.normpath(effective_new) == os.path.normpath(current_dir):
-            QMessageBox.information(self, "提示", "数据目录未改变")
+        result = dlg.get_result()
+        if not result:
             return
 
-        self.logger.info(f"用户更改数据目录: {current_dir} -> {effective_new}")
-        try:
-            self.config.set_data_dir(new_dir)
-            QMessageBox.information(
-                self, "成功",
-                f"数据目录已更改为:\n{self.config.data_dir}\n\n"
-                f"数据库路径: {self.config.database_path}\n"
-                f"日志路径: {self.config.log_path}\n\n"
-                "请重启程序以应用更改。"
-            )
-        except Exception as e:
-            self.logger.error(f"设置数据目录失败: {e}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"设置数据目录失败:\n{str(e)}")
+        new_display = f"{result['host']}:{result['port']}/{result['database']}"
+        if new_display == old_display:
+            QMessageBox.information(self, "提示", "数据库连接未改变")
+            return
+
+        self.config.set_pg_connection(
+            result["host"],
+            result["port"],
+            result["user"],
+            result["password"],
+            result["database"],
+        )
+        self.logger.info(f"用户更改数据库连接: {old_display} -> {new_display}")
+        QMessageBox.information(
+            self,
+            "成功",
+            f"数据库连接已切换为:\n{new_display}\n\n"
+            f"日志路径: {self.config.log_path}\n\n"
+            "请重启程序以应用更改。",
+        )
 
     def _set_actions_enabled(self, enabled: bool):
         self._act_import_images.setEnabled(enabled)
@@ -833,3 +836,4 @@ class MainWindow(QMainWindow):
         self._act_redetect.setEnabled(enabled)
         self._act_cluster.setEnabled(enabled)
         self._act_clear.setEnabled(enabled)
+        self._act_switch_db.setEnabled(enabled)

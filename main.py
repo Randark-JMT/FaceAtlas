@@ -12,7 +12,7 @@ from core.database import DatabaseManager
 from core.face_engine import FaceEngine
 from ui import APP_NAME, APP_VERSION
 from ui.main_window import MainWindow
-from ui.data_dir_dialog import show_data_dir_dialog
+from ui.pg_connect_dialog import show_pg_connect_dialog
 
 
 def main():
@@ -58,8 +58,8 @@ def main():
     """
     )
 
-    # ---- 每次启动都弹出数据目录选择对话框，方便切换数据集 ----
-    if not show_data_dir_dialog(config):
+    # ---- 每次启动弹出 PostgreSQL 连接对话框 ----
+    if not show_pg_connect_dialog(config):
         # 用户关闭了对话框，直接退出程序
         sys.exit(0)
 
@@ -67,8 +67,7 @@ def main():
     logger = setup_logger(config.log_path)
     logger.info("=" * 60)
     logger.info("FaceAtlas 启动")
-    logger.info(f"数据目录: {config.data_dir}")
-    logger.info(f"数据库路径: {config.database_path}")
+    logger.info(f"数据库: {config.database_display}")
     logger.info(f"日志路径: {config.log_path}")
     logger.info("=" * 60)
     # 获取模型文件路径（只读资源，从资源目录读取）
@@ -98,7 +97,13 @@ def main():
     # 初始化核心组件
     try:
         logger.info("初始化数据库...")
-        db = DatabaseManager(config.database_path)
+        db = DatabaseManager(
+            host=config.pg_host,
+            port=config.pg_port,
+            user=config.pg_user,
+            password=config.pg_password,
+            database=config.pg_database,
+        )
         logger.info("初始化人脸识别引擎...")
         engine = FaceEngine(
             detection_model,
@@ -116,7 +121,9 @@ def main():
         sys.exit(1)
 
     window = MainWindow(engine, db, config)
-    window.setWindowTitle(f"{APP_NAME} - {APP_VERSION}  [后端: {engine.backend_name}]")
+    window.setWindowTitle(
+        f"{APP_NAME} - {APP_VERSION}  [后端: {engine.backend_name}]  [{config.pg_database}]"
+    )
     window.show()
 
     logger.info("主窗口已显示，程序就绪")

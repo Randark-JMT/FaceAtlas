@@ -1,11 +1,7 @@
-"""配置管理模块 - 资源文件与数据文件分离管理
-
-资源文件（模型等）：自动释放到打包临时目录或项目目录，不可配置
-数据文件（数据库、日志）：可由用户选择存放在 AppData 默认目录或自定义目录
-配置文件本身始终存在 AppData 目录下
-"""
+"""配置管理模块 - 资源文件固定，数据库连接可配置（PostgreSQL）"""
 
 import os
+import re
 import sys
 import json
 from typing import Optional
@@ -45,15 +41,8 @@ def _get_resource_base() -> str:
 
 
 class Config:
-    """配置管理器
+    """配置管理器"""
 
-    - 资源文件（模型）：通过 get_resource_path() 访问，路径固定不可配置
-    - 数据文件（db / log）：通过 data_dir 属性访问，用户可选择目录
-    - 配置文件本身存储在 AppData 目录下，始终固定
-    """
-
-    # 数据文件名
-    DB_FILENAME = "FaceAtlas.db"
     LOG_FILENAME = "FaceAtlas.log"
 
     def __init__(self):
@@ -66,9 +55,13 @@ class Config:
         # 资源文件基目录（固定）
         self._resource_base = _get_resource_base()
 
-        # 数据目录（用户可配置）
-        self._data_dir: Optional[str] = None
-        self._data_dir_configured: bool = False
+        # PostgreSQL 连接配置
+        self._pg_host: str = "localhost"
+        self._pg_port: int = 5432
+        self._pg_user: str = "postgres"
+        self._pg_password: str = ""
+        self._pg_database: str = "faceatlas"
+        self._pg_configured: bool = False
         self._detection_input_max_side: int = 0
 
         self._load_config()
@@ -83,8 +76,12 @@ class Config:
             try:
                 with open(self._config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self._data_dir = data.get("data_dir") or None
-                    self._data_dir_configured = data.get("data_dir_configured", False)
+                    self._pg_host = str(data.get("pg_host", "localhost"))
+                    self._pg_port = int(data.get("pg_port", 5432))
+                    self._pg_user = str(data.get("pg_user", "postgres"))
+                    self._pg_password = str(data.get("pg_password", ""))
+                    self._pg_database = str(data.get("pg_database", "faceatlas"))
+                    self._pg_configured = bool(data.get("pg_configured", False))
                     # 检测输入最长边上限，0=不限制；640/1280 可提高 CUDA 吞吐与利用率
                     self._detection_input_max_side = max(0, int(data.get("detection_input_max_side", 0)))
             except Exception as e:
@@ -94,8 +91,13 @@ class Config:
         """保存配置到 AppData/config.json"""
         try:
             data = {
-                "data_dir": self._data_dir,
-                "data_dir_configured": self._data_dir_configured,
+                "pg_host": self._pg_host,
+                "pg_port": self._pg_port,
+                "pg_user": self._pg_user,
+                "pg_password": self._pg_password,
+                "pg_database": self._pg_database,
+                "pg_configured": self._pg_configured,
+                "detection_input_max_side": self._detection_input_max_side,
             }
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -103,40 +105,28 @@ class Config:
             print(f"警告：保存配置文件失败: {e}")
 
     # ================================================
-    # 数据目录
+    # 数据目录（兼容保留）
     # ================================================
 
     @property
     def default_data_dir(self) -> str:
-        """默认数据目录（AppData 下）"""
+        """兼容旧代码：统一使用 AppData"""
         return self._appdata_dir
 
     @property
     def data_dir(self) -> str:
-        """当前生效的数据目录"""
-        d = self._data_dir if self._data_dir else self._appdata_dir
-        os.makedirs(d, exist_ok=True)
-        return d
+        """兼容旧代码：统一使用 AppData"""
+        os.makedirs(self._appdata_dir, exist_ok=True)
+        return self._appdata_dir
 
     @property
     def is_data_dir_configured(self) -> bool:
-        """用户是否已经配置过数据目录"""
-        return self._data_dir_configured
+        """兼容旧代码：总是 True"""
+        return True
 
     def set_data_dir(self, path: Optional[str]):
-        """设置数据目录
-
-        Args:
-            path: 自定义路径。传 None 或空字符串表示使用默认 AppData 目录。
-        """
-        if path:
-            path = os.path.abspath(path)
-            os.makedirs(path, exist_ok=True)
-            self._data_dir = path
-        else:
-            self._data_dir = None
-        self._data_dir_configured = True
-        self._save_config()
+        """兼容旧接口：保留空实现"""
+        _ = path
 
     # ---- 兼容旧属性名 ----
 
@@ -150,18 +140,68 @@ class Config:
         self.set_data_dir(path)
 
     # ================================================
-    # 数据文件路径
+    # PostgreSQL 配置
     # ================================================
 
     @property
+    def is_pg_configured(self) -> bool:
+        return self._pg_configured
+
+    @property
+    def pg_host(self) -> str:
+        return self._pg_host
+
+    @property
+    def pg_port(self) -> int:
+        return self._pg_port
+
+    @property
+    def pg_user(self) -> str:
+        return self._pg_user
+
+    @property
+    def pg_password(self) -> str:
+        return self._pg_password
+
+    @property
+    def pg_database(self) -> str:
+        return self._pg_database
+
+    def set_pg_connection(self, host: str, port: int, user: str, password: str, database: str):
+        self._pg_host = host.strip() or "localhost"
+        self._pg_port = int(port)
+        self._pg_user = user.strip() or "postgres"
+        self._pg_password = password
+        self._pg_database = database.strip()
+        self._pg_configured = True
+        self._save_config()
+
+    @property
     def database_path(self) -> str:
-        """数据库文件完整路径"""
-        return os.path.join(self.data_dir, self.DB_FILENAME)
+        """兼容旧日志字段名：返回 PostgreSQL 连接标识"""
+        return f"postgresql://{self._pg_user}@{self._pg_host}:{self._pg_port}/{self._pg_database}"
+
+    @property
+    def database_display(self) -> str:
+        return f"{self._pg_host}:{self._pg_port}/{self._pg_database}"
 
     @property
     def log_path(self) -> str:
-        """日志文件完整路径"""
-        return os.path.join(self.data_dir, self.LOG_FILENAME)
+        """日志文件路径（按数据库名区分）"""
+        logs_dir = os.path.join(self._appdata_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        db_part = self._sanitize_name(self._pg_database or "default")
+        return os.path.join(logs_dir, f"FaceAtlas-{db_part}.log")
+
+    @property
+    def thumb_cache_dir(self) -> str:
+        """缩略图缓存目录（按数据库名隔离）"""
+        cache_root = os.path.join(self._appdata_dir, "thumb_cache")
+        os.makedirs(cache_root, exist_ok=True)
+        db_part = self._sanitize_name(self._pg_database or "default")
+        cache_dir = os.path.join(cache_root, db_part)
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
 
     @property
     def detection_input_max_side(self) -> int:
@@ -191,22 +231,10 @@ class Config:
     # ================================================
 
     @staticmethod
-    def check_existing_data(directory: str) -> dict:
-        """检查指定目录下是否存在已有数据文件
-
-        Returns:
-            dict: {"db": bool, "log": bool, "db_size": int, "log_size": int}
-        """
-        result = {"db": False, "log": False, "db_size": 0, "log_size": 0}
-        db_file = os.path.join(directory, Config.DB_FILENAME)
-        log_file = os.path.join(directory, Config.LOG_FILENAME)
-        if os.path.isfile(db_file):
-            result["db"] = True
-            result["db_size"] = os.path.getsize(db_file)
-        if os.path.isfile(log_file):
-            result["log"] = True
-            result["log_size"] = os.path.getsize(log_file)
-        return result
+    def _sanitize_name(name: str) -> str:
+        """将任意名称转换为安全文件名片段"""
+        cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+        return cleaned[:64] if cleaned else "default"
 
 
 # ---- 全局单例 ----
