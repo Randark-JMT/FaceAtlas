@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
         self.engine = engine
         self.db = db
         self.config = config
-        self.cluster_engine = FaceCluster(db, engine.recognizer)
+        self.cluster_engine = FaceCluster(db)
         self.logger = get_logger()
 
         self._current_image_id: int | None = None

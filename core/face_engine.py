@@ -141,6 +141,7 @@ class FaceEngine:
         self.logger = get_logger()
         self._device = _get_device(device)
         self.backend_name = "CUDA" if self._device.type == "cuda" else "CPU"
+        self.logger.info(f"FaceEngine 初始化成功 [后端: {self.backend_name}]")
         self._detection_input_max_side = max(0, detection_input_max_side)
         self._mtcnn_image_size = mtcnn_image_size
         self._mtcnn_margin = mtcnn_margin
