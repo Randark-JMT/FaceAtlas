@@ -44,14 +44,14 @@ class FaceCluster:
         self.recognizer = recognizer
         self.logger = get_logger()
 
-    def cluster(self, cosine_threshold: float = 0.363,
+    def cluster(self, cosine_threshold: float = 0.60,
                 progress_cb=None, incremental: bool = True) -> dict[int, list[int]]:
         """
         对数据库中所有有特征的人脸进行聚类。
         使用 numpy 向量化矩阵乘法计算余弦相似度，性能远优于逐对调用。
 
         Args:
-            cosine_threshold: 余弦相似度阈值（SFace 推荐 0.363）
+            cosine_threshold: 余弦相似度阈值（FaceNet 512 维常用约 0.5~0.7，原 SFace 约 0.363）
             progress_cb: 进度回调 (current, total, stage_text)
             incremental: 是否增量聚类（保留已有人物归类）
 

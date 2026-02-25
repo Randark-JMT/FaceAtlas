@@ -1,12 +1,20 @@
-"""人脸检测与识别引擎，基于 OpenCV YuNet + SFace"""
+"""人脸检测与识别引擎，基于 facenet-pytorch（MTCNN + InceptionResnetV1）"""
 
 import os
 import cv2
 import numpy as np
+import torch
+from PIL import Image
 from dataclasses import dataclass, field
 from typing import Optional
 
+from facenet_pytorch import MTCNN, InceptionResnetV1
+
 from core.logger import get_logger, log_opencv_error
+
+
+# FaceNet 特征向量维度（InceptionResnetV1 输出）
+FEATURE_DIM = 512
 
 
 @dataclass
@@ -28,7 +36,7 @@ class FaceData:
 
 def imread_unicode(filepath: str) -> np.ndarray | None:
     """读取 Unicode 路径的图像（解决 Windows 上 cv2.imread 不支持非 ASCII 路径的问题）
-    
+
     返回的图像保证为 3 通道 uint8 BGR 连续数组，或 None。
     """
     try:
@@ -36,10 +44,8 @@ def imread_unicode(filepath: str) -> np.ndarray | None:
         if buf.size == 0:
             return None
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        # 验证图像有效性：不为 None，维度正确，且有实际内容
         if img is None or img.size == 0 or len(img.shape) < 2:
             return None
-        # 归一化图像格式，确保 YuNet / SFace 能正确处理
         img = _normalize_image(img)
         return img
     except Exception as e:
@@ -48,14 +54,10 @@ def imread_unicode(filepath: str) -> np.ndarray | None:
 
 
 def _normalize_image(img: np.ndarray) -> np.ndarray | None:
-    """将图像归一化为 3 通道 uint8 BGR 连续数组。
-    
-    处理灰度、RGBA、16-bit 等非标准格式，返回 None 表示无法转换。
-    """
+    """将图像归一化为 3 通道 uint8 BGR 连续数组。"""
     if img is None or img.size == 0:
         return None
 
-    # 转换为 uint8（处理 16-bit / float 图像）
     if img.dtype != np.uint8:
         if img.dtype in (np.float32, np.float64):
             img = np.clip(img * 255, 0, 255).astype(np.uint8)
@@ -64,69 +66,36 @@ def _normalize_image(img: np.ndarray) -> np.ndarray | None:
         else:
             img = img.astype(np.uint8)
 
-    # 转换通道数
     if len(img.shape) == 2:
-        # 灰度 → BGR
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif len(img.shape) == 3:
         channels = img.shape[2]
         if channels == 1:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif channels == 4:
-            # RGBA / BGRA → BGR
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         elif channels != 3:
-            return None  # 不支持的通道数
+            return None
     else:
         return None
 
-    # 确保内存连续（某些 OpenCV DNN 操作要求 contiguous）
-    if not img.flags['C_CONTIGUOUS']:
+    if not img.flags["C_CONTIGUOUS"]:
         img = np.ascontiguousarray(img)
-
     return img
 
 
-def detect_backends() -> tuple[int, int, str]:
-    """检测可用的 DNN 后端，优先级: CUDA > CPU。
-    
-    注: OpenCL (ocl4dnn) 对 YuNet/SFace 等小型模型反而更慢（CPU↔GPU 搬运开销大），
-    实测 RTX 4060 上 OpenCL 比 CPU 慢约 5 倍，因此不作为候选。
-    如需 GPU 加速，请安装支持 CUDA 的 OpenCV 构建版本。
-    
-    返回 (backend_id, target_id, name)
-    """
-    logger = get_logger()
+def _bgr_to_rgb(img: np.ndarray) -> np.ndarray:
+    """BGR -> RGB，返回连续数组"""
+    out = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if not out.flags["C_CONTIGUOUS"]:
+        out = np.ascontiguousarray(out)
+    return out
 
-    # 候选后端列表（按优先级排列）
-    # OpenCL 对小型 DNN 模型无加速效果，故不纳入
-    candidates = [
-        (cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA, "CUDA"),
-    ]
 
-    try:
-        if hasattr(cv2.dnn, 'getAvailableTargets'):
-            # OpenCV 4.13+ 新 API
-            for backend_id, target_id, name in candidates:
-                try:
-                    targets = cv2.dnn.getAvailableTargets(backend_id)
-                    if target_id in targets:
-                        logger.info(f"检测到 {name} 后端可用")
-                        return backend_id, target_id, name
-                except Exception:
-                    continue
-        elif hasattr(cv2.dnn, 'getAvailableBackends'):
-            # 兼容旧版 OpenCV (<4.13)
-            available = cv2.dnn.getAvailableBackends()
-            for backend_id, target_id, name in candidates:
-                if (backend_id, target_id) in available:
-                    logger.info(f"检测到 {name} 后端可用")
-                    return backend_id, target_id, name
-    except Exception as e:
-        log_opencv_error("detect_backends", e, suppress=True)
-
-    logger.info("使用 CPU 后端")
-    return cv2.dnn.DNN_BACKEND_DEFAULT, cv2.dnn.DNN_TARGET_CPU, "CPU"
+def _get_device(device: Optional[torch.device] = None) -> torch.device:
+    if device is not None:
+        return device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # 关键点颜色 (BGR)
@@ -139,269 +108,194 @@ LANDMARK_COLORS = [
 ]
 
 
+def _prewhiten(x: np.ndarray) -> np.ndarray:
+    """FaceNet 输入预处理：归一化到约 [-1, 1]（uint8 [0,255] -> (x-127.5)/128）"""
+    return (x.astype(np.float32) - 127.5) / 128.0
+
+
 class FaceEngine:
-    """人脸检测 + 识别引擎"""
+    """人脸检测 + 识别引擎（MTCNN + InceptionResnetV1）"""
 
     SUPPORTED_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-    # 最小人脸尺寸（宽或高小于此值的检测结果将被丢弃，太小的人脸特征不可靠）
     MIN_FACE_SIZE = 50
 
     def __init__(
         self,
-        detection_model: str,
-        recognition_model: str,
-        score_threshold: float = 0.7,
-        nms_threshold: float = 0.3,
-        top_k: int = 5000,
-        backend_id: int | None = None,
-        target_id: int | None = None,
         detection_input_max_side: int = 0,
+        device: Optional[torch.device] = None,
+        mtcnn_image_size: int = 160,
+        mtcnn_margin: int = 0,
+        mtcnn_thresholds: tuple = (0.6, 0.7, 0.7),
+        pretrained: str = "vggface2",
     ):
         """
         Args:
-            detection_input_max_side: 检测时输入图像最长边上限，0 表示不限制（使用原图尺寸）。
-                设为 640 或 1280 可在大图时缩小再检测，减轻 GPU 负载、提高吞吐；CUDA 下有助于提高利用率。
+            detection_input_max_side: 检测时输入图像最长边上限，0 表示不限制。
+            device: PyTorch 设备，None 时自动选择 CUDA（若可用）或 CPU。
+            mtcnn_image_size: MTCNN 输出人脸尺寸，需与 InceptionResnet 一致，默认 160。
+            mtcnn_margin: 人脸框外扩像素。
+            mtcnn_thresholds: MTCNN 三阶段阈值。
+            pretrained: InceptionResnet 预训练集，'vggface2' 或 'casia-webface'。
         """
         self.logger = get_logger()
-        
-        if not os.path.exists(detection_model):
-            raise FileNotFoundError(
-                f"找不到检测模型: {detection_model}\n"
-                "请从 https://github.com/opencv/opencv_zoo/tree/master/models/face_detection_yunet 下载"
-            )
-        if not os.path.exists(recognition_model):
-            raise FileNotFoundError(
-                f"找不到识别模型: {recognition_model}\n"
-                "请从 https://github.com/opencv/opencv_zoo/tree/master/models/face_recognition_sface 下载"
-            )
-
-        # 保存参数用于 clone()
-        self._detection_model = detection_model
-        self._recognition_model = recognition_model
-        self._score_threshold = score_threshold
-        self._nms_threshold = nms_threshold
-        self._top_k = top_k
+        self._device = _get_device(device)
+        self.backend_name = "CUDA" if self._device.type == "cuda" else "CPU"
         self._detection_input_max_side = max(0, detection_input_max_side)
+        self._mtcnn_image_size = mtcnn_image_size
+        self._mtcnn_margin = mtcnn_margin
+        self._mtcnn_thresholds = mtcnn_thresholds
+        self._pretrained = pretrained
 
-        if backend_id is None:
-            backend_id, target_id, self.backend_name = detect_backends()
-        else:
-            self.backend_name = "CUDA" if target_id == cv2.dnn.DNN_TARGET_CUDA else "CPU"
-
-        self._backend_id = backend_id
-        self._target_id = target_id
-        # 仅当 CUDA 下出现 cuDNN 错误时，用 CPU 做单次重试；懒创建，不替换主引擎
-        self._cpu_detector: Optional[cv2.FaceDetectorYN] = None
-        self._cpu_recognizer: Optional[cv2.FaceRecognizerSF] = None
-
-        self.logger.info(f"初始化人脸检测器: {detection_model}")
-        self.logger.info(f"初始化人脸识别器: {recognition_model}")
-
-        self.detector = cv2.FaceDetectorYN.create(
-            detection_model, "", (320, 320),
-            score_threshold, nms_threshold, top_k,
-            backend_id, target_id,
-        )
-        self.recognizer = cv2.FaceRecognizerSF.create(
-            recognition_model, "", backend_id, target_id,
+        self.logger.info("初始化 MTCNN 人脸检测器...")
+        self.mtcnn = MTCNN(
+            image_size=mtcnn_image_size,
+            margin=mtcnn_margin,
+            thresholds=mtcnn_thresholds,
+            keep_all=True,
+            device=self._device,
         )
 
-    def _is_cuda_cudnn_error(self, e: Exception) -> bool:
-        """判断是否为 CUDA/cuDNN 运行时错误（如卷积算法不可用），此类错误可用 CPU 单次重试。"""
-        msg = str(e).lower()
-        return (
-            "cudnn" in msg and ("algorithm" in msg or "convolution" in msg)
-        ) or (
-            hasattr(e, "code") and getattr(e, "code", None) == -217
-        )
-
-    def _get_cpu_detector(self) -> cv2.FaceDetectorYN:
-        """懒创建并返回仅用于 cuDNN 失败时单次重试的 CPU 检测器，主引擎仍用 CUDA。"""
-        if self._cpu_detector is None:
-            self._cpu_detector = cv2.FaceDetectorYN.create(
-                self._detection_model, "", (320, 320),
-                self._score_threshold, self._nms_threshold, self._top_k,
-                cv2.dnn.DNN_BACKEND_DEFAULT, cv2.dnn.DNN_TARGET_CPU,
-            )
-        return self._cpu_detector
-
-    def _get_cpu_recognizer(self) -> cv2.FaceRecognizerSF:
-        """懒创建并返回仅用于 cuDNN 失败时单次重试的 CPU 识别器，主引擎仍用 CUDA。"""
-        if self._cpu_recognizer is None:
-            self._cpu_recognizer = cv2.FaceRecognizerSF.create(
-                self._recognition_model, "",
-                cv2.dnn.DNN_BACKEND_DEFAULT, cv2.dnn.DNN_TARGET_CPU,
-            )
-        return self._cpu_recognizer
+        self.logger.info("初始化 InceptionResnetV1 人脸识别模型...")
+        self.resnet = InceptionResnetV1(pretrained=pretrained).eval().to(self._device)
 
     def clone(self) -> "FaceEngine":
-        """创建一个独立的引擎实例（用于多线程，每个线程需要自己的 detector 实例）"""
+        """创建独立的引擎实例（用于多线程）"""
         return FaceEngine(
-            self._detection_model, self._recognition_model,
-            self._score_threshold, self._nms_threshold, self._top_k,
-            self._backend_id, self._target_id,
-            self._detection_input_max_side,
+            detection_input_max_side=self._detection_input_max_side,
+            device=self._device,
+            mtcnn_image_size=self._mtcnn_image_size,
+            mtcnn_margin=self._mtcnn_margin,
+            mtcnn_thresholds=self._mtcnn_thresholds,
+            pretrained=self._pretrained,
         )
 
+    def _prepare_detect_image(self, image: np.ndarray) -> tuple[Image.Image, float]:
+        """BGR numpy -> RGB PIL，可选缩放，返回 (pil_image, scale)."""
+        h, w = image.shape[:2]
+        scale = 1.0
+        if self._detection_input_max_side > 0 and max(w, h) > self._detection_input_max_side:
+            scale = self._detection_input_max_side / max(w, h)
+            nw, nh = int(round(w * scale)), int(round(h * scale))
+            if nw < 1:
+                nw = 1
+            if nh < 1:
+                nh = 1
+            image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        rgb = _bgr_to_rgb(image)
+        pil = Image.fromarray(rgb)
+        return pil, scale
+
     def detect(self, image: np.ndarray, min_face_size: int | None = None) -> list[FaceData]:
-        """检测图像中所有人脸
+        """检测图像中所有人脸。
 
         Args:
-            image: 输入图像 (BGR)
-            min_face_size: 最小人脸尺寸，低于此值的检测结果会被过滤。
-                           None 时使用类默认值 MIN_FACE_SIZE。
+            image: 输入图像 (BGR, numpy).
+            min_face_size: 最小人脸尺寸，低于此值的检测结果会被过滤；None 时使用 MIN_FACE_SIZE。
         """
-        # 验证输入图像的有效性
         if image is None or image.size == 0 or len(image.shape) < 2:
             self.logger.warning("detect: 输入图像无效")
             return []
-        
-        try:
-            h, w = image.shape[:2]
-            if h <= 0 or w <= 0:
-                self.logger.warning(f"detect: 图像尺寸无效 ({w}x{h})")
-                return []
 
-            # 防御性检查：确保图像是 3 通道 uint8（避免 OpenCV 断言失败）
+        try:
             if image.dtype != np.uint8 or len(image.shape) != 3 or image.shape[2] != 3:
                 image = _normalize_image(image)
                 if image is None:
                     self.logger.warning("detect: 图像格式无法转换为 BGR uint8")
                     return []
 
-            if not image.flags['C_CONTIGUOUS']:
+            if not image.flags["C_CONTIGUOUS"]:
                 image = np.ascontiguousarray(image)
 
-            # 可选：将大图缩放到最长边上限再检测，减轻 GPU 负载、提高吞吐（CUDA 下更易吃满）
-            scale = 1.0
-            detect_img = image
-            dw, dh = w, h
-            if self._detection_input_max_side > 0 and max(w, h) > self._detection_input_max_side:
-                scale = self._detection_input_max_side / max(w, h)
-                dw = int(round(w * scale))
-                dh = int(round(h * scale))
-                if dw < 1:
-                    dw = 1
-                if dh < 1:
-                    dh = 1
-                detect_img = cv2.resize(image, (dw, dh), interpolation=cv2.INTER_LINEAR)
-                if not detect_img.flags['C_CONTIGUOUS']:
-                    detect_img = np.ascontiguousarray(detect_img)
+            pil_img, scale = self._prepare_detect_image(image)
+            boxes, probs, landmarks = self.mtcnn.detect(pil_img, landmarks=True)
 
-            self.detector.setInputSize((dw, dh))
-            try:
-                _, raw_faces = self.detector.detect(detect_img)
-            except Exception as e:
-                if (
-                    self._target_id == cv2.dnn.DNN_TARGET_CUDA
-                    and self._is_cuda_cudnn_error(e)
-                ):
-                    log_opencv_error("FaceEngine.detect", e, suppress=True)
-                    cpu_det = self._get_cpu_detector()
-                    cpu_det.setInputSize((dw, dh))
-                    _, raw_faces = cpu_det.detect(detect_img)
-                else:
-                    raise
-
-            if raw_faces is None or len(raw_faces) == 0:
+            if boxes is None or len(boxes) == 0:
                 return []
 
             min_sz = min_face_size if min_face_size is not None else self.MIN_FACE_SIZE
-            inv_scale = 1.0 / scale  # 将检测坐标还原到原图
-
+            inv_scale = 1.0 / scale
             results = []
-            for face_row in raw_faces:
-                try:
-                    # 验证数值有效性（过滤 inf/nan）
-                    if not all(np.isfinite(face_row[:4])):
-                        continue
-                    
-                    # 若做了缩放检测，将 bbox/关键点还原到原图坐标
-                    x, y, fw, fh = face_row[0], face_row[1], face_row[2], face_row[3]
-                    if scale != 1.0:
-                        x, y, fw, fh = x * inv_scale, y * inv_scale, fw * inv_scale, fh * inv_scale
-                    bbox = tuple(map(int, (x, y, fw, fh)))
-                    # 过滤过小的人脸（特征不可靠）
-                    if bbox[2] < min_sz or bbox[3] < min_sz:
-                        continue
 
-                    # 验证关键点数值有效性
-                    landmark_coords = face_row[4:14]
-                    if not all(np.isfinite(landmark_coords)):
-                        continue
-                    
-                    if scale != 1.0:
-                        landmarks = [
-                            (int(face_row[4 + j * 2] * inv_scale), int(face_row[5 + j * 2] * inv_scale))
-                            for j in range(5)
-                        ]
-                    else:
-                        landmarks = [
-                            (int(face_row[4 + j * 2]), int(face_row[5 + j * 2]))
-                            for j in range(5)
-                        ]
-                    score = float(face_row[14])
-                    results.append(FaceData(bbox=bbox, landmarks=landmarks, score=score))
-                except (ValueError, OverflowError) as e:
-                    # 跳过无效的检测结果
-                    self.logger.debug(f"跳过无效检测结果: {e}")
+            for i in range(len(boxes)):
+                box = boxes[i]
+                prob = probs[i] if probs is not None else 1.0
+                if prob is None or not np.isfinite(prob):
                     continue
+                if not all(np.isfinite(box)):
+                    continue
+
+                x1, y1, x2, y2 = box
+                if scale != 1.0:
+                    x1, y1, x2, y2 = x1 * inv_scale, y1 * inv_scale, x2 * inv_scale, y2 * inv_scale
+                x, y = int(x1), int(y1)
+                w, h = int(x2 - x1), int(y2 - y1)
+                if w < min_sz or h < min_sz:
+                    continue
+
+                bbox = (x, y, w, h)
+                if landmarks is not None and i < len(landmarks):
+                    lm = landmarks[i]
+                    if scale != 1.0:
+                        lm = lm * inv_scale
+                    landlist = [(int(lm[j, 0]), int(lm[j, 1])) for j in range(5)]
+                else:
+                    landlist = [(0, 0)] * 5
+
+                results.append(FaceData(bbox=bbox, landmarks=landlist, score=float(prob)))
             return results
+
         except Exception as e:
-            log_opencv_error("FaceEngine.detect", e, suppress=True)
+            self.logger.warning("FaceEngine.detect: %s", e, exc_info=True)
             return []
 
+    def _crop_face_for_resnet(self, image: np.ndarray, face: FaceData, margin: float = 0.2) -> torch.Tensor | None:
+        """根据 bbox 裁剪人脸并预处理为 ResNet 输入：160x160，prewhiten，NCHW tensor。"""
+        x, y, w, h = face.bbox
+        img_h, img_w = image.shape[:2]
+        pad_w = int(w * margin)
+        pad_h = int(h * margin)
+        x1 = max(0, x - pad_w)
+        y1 = max(0, y - pad_h)
+        x2 = min(img_w, x + w + pad_w)
+        y2 = min(img_h, y + h + pad_h)
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        # BGR -> RGB, resize 160x160
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crop_resized = cv2.resize(crop_rgb, (self._mtcnn_image_size, self._mtcnn_image_size), interpolation=cv2.INTER_LINEAR)
+        # prewhiten, HWC -> CHW, float32 tensor
+        normalized = _prewhiten(crop_resized)
+        tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0).float().to(self._device)
+        return tensor
+
     def extract_feature(self, image: np.ndarray, face: FaceData) -> np.ndarray:
-        """提取单张人脸的特征向量（L2 归一化）"""
-        # 验证输入图像的有效性
+        """提取单张人脸的特征向量（512 维，L2 归一化）。"""
         if image is None or image.size == 0 or len(image.shape) < 2:
             self.logger.warning("extract_feature: 输入图像无效")
             face.feature = None
-            return np.zeros(128, dtype=np.float32)
-        
-        try:
-            try:
-                aligned = self.recognizer.alignCrop(image, face.to_detect_array())
-            except Exception as e:
-                if (
-                    self._target_id == cv2.dnn.DNN_TARGET_CUDA
-                    and self._is_cuda_cudnn_error(e)
-                ):
-                    log_opencv_error("FaceEngine.extract_feature", e, suppress=True)
-                    aligned = self._get_cpu_recognizer().alignCrop(
-                        image, face.to_detect_array()
-                    )
-                else:
-                    raise
-            # 验证对齐后的图像是否有效
-            if aligned is None or aligned.size == 0:
-                self.logger.warning("extract_feature: 人脸对齐失败")
-                face.feature = None
-                return np.zeros(128, dtype=np.float32)
+            return np.zeros(FEATURE_DIM, dtype=np.float32)
 
-            try:
-                feature = self.recognizer.feature(aligned)
-            except Exception as e:
-                if (
-                    self._target_id == cv2.dnn.DNN_TARGET_CUDA
-                    and self._is_cuda_cudnn_error(e)
-                ):
-                    log_opencv_error("FaceEngine.extract_feature", e, suppress=True)
-                    feature = self._get_cpu_recognizer().feature(aligned)
-                else:
-                    raise
-            # L2 归一化，确保后续余弦相似度计算的数值稳定性
+        try:
+            tensor = self._crop_face_for_resnet(image, face)
+            if tensor is None:
+                self.logger.warning("extract_feature: 人脸裁剪失败")
+                face.feature = None
+                return np.zeros(FEATURE_DIM, dtype=np.float32)
+
+            with torch.no_grad():
+                embedding = self.resnet(tensor)
+            feature = embedding.cpu().numpy().flatten().astype(np.float32)
             norm = np.linalg.norm(feature)
             if norm > 0:
                 feature = feature / norm
             face.feature = feature
             return feature
         except Exception as e:
-            log_opencv_error("FaceEngine.extract_feature", e, suppress=True)
-            # 返回一个零向量
+            self.logger.warning("FaceEngine.extract_feature: %s", e, exc_info=True)
             face.feature = None
-            return np.zeros(128, dtype=np.float32)
+            return np.zeros(FEATURE_DIM, dtype=np.float32)
 
     def extract_features(self, image: np.ndarray, faces: list[FaceData]) -> list[FaceData]:
         """批量提取人脸特征"""
@@ -410,10 +304,14 @@ class FaceEngine:
         return faces
 
     def compare(self, feat1: np.ndarray, feat2: np.ndarray) -> float:
-        """比较两个特征向量的余弦相似度"""
-        return float(
-            self.recognizer.match(feat1, feat2, cv2.FaceRecognizerSF_FR_COSINE)
-        )
+        """比较两个特征向量的余弦相似度（特征应为 L2 归一化，则余弦相似度 = 内积）。"""
+        if feat1.size == 0 or feat2.size == 0:
+            return 0.0
+        a, b = feat1.flatten(), feat2.flatten()
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na < 1e-10 or nb < 1e-10:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
 
     def visualize(
         self,
@@ -444,26 +342,7 @@ class FaceEngine:
 
     @staticmethod
     def compute_blur_score(crop: np.ndarray) -> float:
-        """计算人脸清晰度质量分数（多指标融合）
-
-        融合三种互补的图像质量指标，能够区分「模糊但面部特征可辨」
-        与「严重模糊导致特征失真」两种情况：
-
-        1. Laplacian 方差 — 整体边缘响应强度
-        2. Tenengrad (Sobel 梯度均值) — 对结构性边缘更敏感，
-           能反映面部轮廓（眉眼鼻嘴）是否完整保留
-        3. FFT 高频能量占比 — 区分模糊程度的关键：
-           轻度模糊仍保留中高频结构信息，严重模糊几乎只剩低频
-
-        三项指标经 sigmoid 归一化后加权融合，输出 0-100 分。
-
-        Args:
-            crop: 人脸裁剪区域（BGR 或灰度）
-
-        Returns:
-            质量分数 0-100，越高越清晰
-            参考：< 15 严重模糊（建议丢弃），15-40 模糊但可辨认，> 40 清晰
-        """
+        """计算人脸清晰度质量分数（多指标融合），0-100。"""
         if crop is None or crop.size == 0:
             return 0.0
 
@@ -472,20 +351,15 @@ class FaceEngine:
         if h < 10 or w < 10:
             return 0.0
 
-        # ---- 指标 1: Laplacian 方差 ----
         laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-        # ---- 指标 2: Tenengrad (Sobel 梯度幅度均值) ----
         gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         tenengrad = float(np.sqrt(gx * gx + gy * gy).mean())
 
-        # ---- 指标 3: FFT 高频能量占比 ----
         f = np.fft.fft2(gray.astype(np.float64))
         fshift = np.fft.fftshift(f)
         magnitude = np.abs(fshift)
         cy, cx = h // 2, w // 2
-        # 高频定义：距频谱中心 > 1/3 短边的区域
         radius = min(h, w) / 3.0
         Y, X = np.ogrid[:h, :w]
         dist_sq = (X - cx) ** 2 + (Y - cy) ** 2
@@ -494,7 +368,6 @@ class FaceEngine:
         high_freq_energy = float(magnitude[dist_sq > radius_sq].sum())
         hf_ratio = high_freq_energy / total_energy
 
-        # ---- sigmoid 归一化 → 0-1 ----
         def _sigmoid(x: float, center: float, scale: float) -> float:
             z = -(x - center) / max(scale, 1e-8)
             if z > 30:
@@ -506,8 +379,6 @@ class FaceEngine:
         lap_score = _sigmoid(laplacian_var, 80, 40)
         ten_score = _sigmoid(tenengrad, 25, 12)
         hf_score = _sigmoid(hf_ratio, 0.35, 0.08)
-
-        # 加权融合：FFT 权重最高，因为它对区分两种模糊最有效
         quality = (lap_score * 0.25 + ten_score * 0.35 + hf_score * 0.40) * 100
         return round(quality, 1)
 
