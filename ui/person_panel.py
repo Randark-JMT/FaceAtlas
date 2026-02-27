@@ -333,6 +333,11 @@ class PersonPanel(QWidget):
         self._sort_by = "id"   # "id" 或 "count"
         self._sort_order = "asc"
 
+        # 搜索防抖
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self.refresh)
+
         # 懒加载状态
         self._all_persons: list = []    # 排序后的完整人物列表
         self._loaded_count = 0          # 已加载的 PersonGroup 数量
@@ -344,13 +349,26 @@ class PersonPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 标题栏 + 排序控件
+        # 标题栏 + 搜索框 + 排序控件
         header_layout = QHBoxLayout()
         header_layout.setSpacing(8)
 
         title = QLabel("人物归类")
         title.setStyleSheet("font-weight: bold; font-size: 11pt; padding: 4px;")
         header_layout.addWidget(title)
+
+        search_label = QLabel("搜索:")
+        search_label.setStyleSheet("font-size: 9pt;")
+        header_layout.addWidget(search_label)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("人物ID(P123)/图片ID(I123)/人脸ID(F123)/姓名")
+        self._search_edit.setMinimumWidth(200)
+        self._search_edit.setStyleSheet(
+            "QLineEdit { background: #2a2a2a; border: 1px solid #555; padding: 4px 8px; }"
+        )
+        self._search_edit.textChanged.connect(self._on_search_changed)
+        header_layout.addWidget(self._search_edit)
 
         header_layout.addStretch()
 
@@ -405,9 +423,11 @@ class PersonPanel(QWidget):
         # 清空
         self._clear_groups()
 
-        persons = self.db.get_all_persons()
+        search_text = self._search_edit.text().strip() if hasattr(self, "_search_edit") else ""
+        persons = self.db.get_persons_filtered(search_text)
         if not persons:
-            placeholder = QLabel("尚未进行人脸归类")
+            placeholder_msg = "无匹配结果" if search_text else "尚未进行人脸归类"
+            placeholder = QLabel(placeholder_msg)
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             placeholder.setStyleSheet("color: #888; padding: 20px;")
             self._container_layout.addWidget(placeholder)
@@ -518,6 +538,11 @@ class PersonPanel(QWidget):
     def _on_name_changed(self, person_id: int, new_name: str):
         if new_name:
             self.db.update_person_name(person_id, new_name)
+
+    def _on_search_changed(self):
+        """搜索框变化时防抖刷新"""
+        self._search_timer.stop()
+        self._search_timer.start(300)
 
     def _on_sort_changed(self):
         self._sort_by = self._sort_combo.currentData()

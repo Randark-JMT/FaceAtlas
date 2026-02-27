@@ -620,6 +620,66 @@ class DatabaseManager:
     def get_all_persons(self) -> list:
         return self._execute_fetchall("SELECT * FROM persons ORDER BY id")
 
+    def get_persons_filtered(self, search: str) -> list:
+        """
+        按搜索关键词筛选人物。
+        支持：人物ID(P123)、图片ID(I123)、人脸ID(F123)、纯数字(同时匹配多种)、姓名模糊匹配。
+        """
+        search = (search or "").strip()
+        if not search:
+            return self.get_all_persons()
+
+        s_lower = search.lower()
+
+        # 显式前缀：P=人物ID, I=图片ID, F=人脸ID
+        if s_lower.startswith("p") and s_lower[1:].isdigit():
+            pid = int(s_lower[1:])
+            return self._execute_fetchall("SELECT * FROM persons WHERE id = %s ORDER BY id", (pid,))
+        if s_lower.startswith("i") and s_lower[1:].isdigit():
+            img_id = int(s_lower[1:])
+            return self._execute_fetchall(
+                """
+                SELECT DISTINCT p.* FROM persons p
+                JOIN faces f ON f.person_id = p.id
+                WHERE f.image_id = %s
+                ORDER BY p.id
+                """,
+                (img_id,),
+            )
+        if s_lower.startswith("f") and s_lower[1:].isdigit():
+            fid = int(s_lower[1:])
+            return self._execute_fetchall(
+                """
+                SELECT p.* FROM persons p
+                JOIN faces f ON f.person_id = p.id
+                WHERE f.id = %s
+                ORDER BY p.id
+                """,
+                (fid,),
+            )
+
+        # 纯数字：同时匹配人物ID、图片ID、人脸ID
+        if search.isdigit():
+            num = int(search)
+            rows = self._execute_fetchall(
+                """
+                SELECT DISTINCT p.* FROM persons p
+                WHERE p.id = %s
+                   OR EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id AND f.image_id = %s)
+                   OR EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id AND f.id = %s)
+                ORDER BY p.id
+                """,
+                (num, num, num),
+            )
+            return rows
+
+        # 姓名模糊匹配
+        pattern = f"%{search}%"
+        return self._execute_fetchall(
+            "SELECT * FROM persons WHERE name ILIKE %s ORDER BY id",
+            (pattern,),
+        )
+
     def get_faces_by_person(self, person_id: int, limit: int = 0) -> list:
         if limit > 0:
             return self._execute_fetchall(
