@@ -874,11 +874,11 @@ class MainWindow(QMainWindow):
                 "参考库为空，请先点击「导入参考库」选择已标记数据集根目录。"
             )
             return
-        face_count = len(self.db.get_unassigned_faces_with_features())
+        face_count = self.db.get_reference_matchable_face_count()
         if face_count == 0:
             QMessageBox.information(
                 self, "参考库匹配",
-                "没有待匹配的未归类人脸。\n请先完成「开始识别」后再执行参考库匹配。"
+                "没有待匹配的人脸。\n请先完成「开始识别」后再执行参考库匹配。"
             )
             return
 

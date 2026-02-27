@@ -854,6 +854,59 @@ class DatabaseManager:
         self._execute("DELETE FROM labeled_persons")
         self._maybe_commit()
 
+    def get_reference_matchable_face_count(self) -> int:
+        """
+        返回可参与参考库匹配的人脸数量：未归类 + 归属于参考库/未知/未命名的人脸。
+        再次匹配时会先清除后者，故这些都应计入待匹配数。
+        """
+        row = self._execute_fetchone(
+            """
+            SELECT COUNT(*) AS cnt FROM faces f
+            WHERE f.feature IS NOT NULL
+              AND (f.person_id IS NULL
+                   OR f.person_id IN (
+                       SELECT id FROM persons
+                       WHERE name IN ('未知', '未命名')
+                          OR name IN (SELECT person_id FROM labeled_persons)
+                   ))
+            """
+        )
+        return int(row["cnt"]) if row else 0
+
+    def clear_reference_match_results(self) -> int:
+        """
+        清除参考库匹配结果：将归属于参考库人物、「未知」或「未命名」的人脸 person_id 置空。
+        用于再次发起参考库匹配时从头开始。这样在「人脸归类」之后仍可执行「特征库匹配」，
+        以已知特征（labeled_persons）为标准重新计算相似度并分组。
+        返回被解除关联的人脸数量。
+        """
+        with self._lock:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH matchable_person_ids AS (
+                        SELECT id FROM persons
+                        WHERE name IN ('未知', '未命名')
+                           OR name IN (SELECT person_id FROM labeled_persons)
+                    )
+                    UPDATE faces SET person_id = NULL
+                    WHERE person_id IN (SELECT id FROM matchable_person_ids)
+                    """
+                )
+                count = cur.rowcount
+                if count > 0:
+                    cur.execute(
+                        """
+                        UPDATE persons p SET face_count = (
+                            SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id
+                        )
+                        WHERE p.name = '未知' OR p.name IN (SELECT person_id FROM labeled_persons)
+                        """
+                    )
+                    cur.execute("DELETE FROM persons WHERE name = '未命名'")
+        self._maybe_commit()
+        return count
+
     def clear_all_persons(self, keep_named: bool = False):
         if keep_named:
             self._execute(

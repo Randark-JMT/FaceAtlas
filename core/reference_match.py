@@ -1,4 +1,4 @@
-"""参考库匹配：将无标记人脸与 labeled_persons 相似度比对，匹配则标记人物，未匹配则标记未知"""
+"""参考库匹配：以 labeled_persons（已知特征）为标准，与人脸相似度比对，按阈值匹配分组，未匹配放入未知"""
 
 import numpy as np
 from PySide6.QtCore import QThread, Signal
@@ -8,7 +8,11 @@ from core.logger import get_logger
 
 
 class ReferenceMatchWorker(QThread):
-    """后台参考库匹配：无标记人脸与 labeled_persons 向量化相似度计算，更新 face.person_id。"""
+    """
+    后台参考库匹配：以 labeled_persons（已知特征）为标准，向量化计算与所有人脸的相似度，
+    按阈值匹配则标记对应人物，未达阈值则放入未知分组。与人脸归类不冲突：
+    执行前会清除参考库/未知/未命名的旧结果，可于人脸归类之后重新匹配。
+    """
 
     progress = Signal(int, int, str)  # current, total, stage_text
     finished_match = Signal(dict)     # {matched: int, unknown: int}
@@ -30,13 +34,18 @@ class ReferenceMatchWorker(QThread):
 
     def run(self):
         refs = self.db.get_labeled_persons_with_features()
-        faces = self.db.get_unassigned_faces_with_features()
 
         if not refs:
             self.logger.warning("参考库匹配: 无参考人物，请先导入参考库")
             self.finished_match.emit({"matched": 0, "unknown": 0})
             return
 
+        # 与人脸归类一致：已有匹配结果时再次匹配，先清除旧结果从头开始
+        cleared = self.db.clear_reference_match_results()
+        if cleared > 0:
+            self.logger.info(f"参考库匹配: 已清除 {cleared} 张人脸的旧匹配结果，从头开始")
+
+        faces = self.db.get_unassigned_faces_with_features()
         if not faces:
             self.logger.info("参考库匹配: 无待匹配人脸")
             self.finished_match.emit({"matched": 0, "unknown": 0})
