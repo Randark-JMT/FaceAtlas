@@ -5,6 +5,7 @@ pyside6
 rich
 zstandard
 psycopg2-binary
+pgvector
 
 # If need use CUDA to incrase calculating speed
 # Available CUDA Version: 
