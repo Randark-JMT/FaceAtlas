@@ -35,7 +35,7 @@ def _to_native(obj: Any) -> Any:
 class DatabaseManager:
     """人脸识别系统数据库管理器（PostgreSQL）"""
 
-    EXPECTED_TABLES = {"faceatlas_meta", "images", "persons", "faces"}
+    EXPECTED_TABLES = {"faceatlas_meta", "images", "persons", "faces", "labeled_persons"}
 
     def __init__(
         self,
@@ -250,6 +250,19 @@ class DatabaseManager:
             )
             """
         )
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS labeled_persons (
+                id BIGSERIAL PRIMARY KEY,
+                person_id TEXT NOT NULL UNIQUE,
+                folder_path TEXT NOT NULL,
+                feature BYTEA,
+                photo_count INTEGER DEFAULT 0,
+                created_time TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        self._execute("CREATE INDEX IF NOT EXISTS idx_labeled_persons_feature ON labeled_persons(id) WHERE feature IS NOT NULL")
         self._execute("CREATE INDEX IF NOT EXISTS idx_faces_image_id ON faces(image_id)")
         self._execute("CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id)")
         self._execute("CREATE INDEX IF NOT EXISTS idx_images_analyzed ON images(analyzed)")
@@ -262,7 +275,7 @@ class DatabaseManager:
             """
             SELECT table_name, column_name
             FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name IN ('images', 'faces', 'persons')
+            WHERE table_schema = 'public' AND table_name IN ('images', 'faces', 'persons', 'labeled_persons')
             """
         )
         columns = {(r["table_name"], r["column_name"]) for r in rows}
@@ -591,6 +604,19 @@ class DatabaseManager:
         self._maybe_commit()
         return person_id
 
+    def get_or_create_person_by_name(self, name: str) -> int:
+        """按姓名查找或创建 person，返回 person id。用于参考库匹配时创建/获取人物。"""
+        row = self._execute_fetchone(
+            "SELECT id FROM persons WHERE name = %s LIMIT 1", (name,)
+        )
+        if row:
+            return int(row["id"])
+        return self.add_person(name)
+
+    def get_or_create_unknown_person(self) -> int:
+        """获取或创建「未知」人物，用于未匹配到参考库的人脸。"""
+        return self.get_or_create_person_by_name("未知")
+
     def get_all_persons(self) -> list:
         return self._execute_fetchall("SELECT * FROM persons ORDER BY id")
 
@@ -714,6 +740,54 @@ class DatabaseManager:
             """,
             (arr, arr, cosine_threshold, arr, limit),
         )
+
+    # ---- Labeled Persons（参考库：已标记人物-大头照） ----
+
+    def add_labeled_person(
+        self,
+        person_id: str,
+        folder_path: str,
+        feature: np.ndarray,
+        photo_count: int,
+    ) -> int:
+        """添加或更新已标记人物（人物编号=文件夹名，特征为多图综合）。"""
+        feature_blob = feature.tobytes() if feature is not None else None
+        row = self._execute_fetchone(
+            "SELECT id FROM labeled_persons WHERE person_id = %s", (person_id,)
+        )
+        if row:
+            self._execute(
+                """
+                UPDATE labeled_persons SET folder_path = %s, feature = %s, photo_count = %s
+                WHERE id = %s
+                """,
+                (folder_path, feature_blob, photo_count, row["id"]),
+            )
+            self._maybe_commit()
+            return int(row["id"])
+        lid = self._execute_returning_id(
+            """
+            INSERT INTO labeled_persons (person_id, folder_path, feature, photo_count)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (person_id, folder_path, feature_blob, photo_count),
+        )
+        self._maybe_commit()
+        return lid
+
+    def get_all_labeled_persons(self) -> list:
+        return self._execute_fetchall("SELECT * FROM labeled_persons ORDER BY id")
+
+    def get_labeled_persons_with_features(self) -> list:
+        return self._execute_fetchall(
+            "SELECT * FROM labeled_persons WHERE feature IS NOT NULL ORDER BY id"
+        )
+
+    def clear_labeled_persons(self):
+        """清空参考库。"""
+        self._execute("DELETE FROM labeled_persons")
+        self._maybe_commit()
 
     def clear_all_persons(self, keep_named: bool = False):
         if keep_named:

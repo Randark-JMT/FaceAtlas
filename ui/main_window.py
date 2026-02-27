@@ -27,6 +27,8 @@ from core.logger import get_logger, log_opencv_error
 from core.database import DatabaseManager
 from core.face_engine import FaceEngine, FaceData, imread_unicode
 from core.face_cluster import FaceCluster
+from core.labeled_import import LabeledImportWorker, load_labeled_dataset
+from core.reference_match import ReferenceMatchWorker
 from core.thumb_cache import ThumbCache
 from ui.image_viewer import ImageViewer
 from ui.face_list_panel import FaceListPanel
@@ -298,6 +300,24 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        self._act_import_reference = QAction("导入参考库", self)
+        self._act_import_reference.setToolTip(
+            "选择根目录（含人物子文件夹，文件夹名=人物编号，内为大头照）\n"
+            "对每人多张大头照进行人脸检测+特征综合，写入参考库"
+        )
+        self._act_import_reference.triggered.connect(self._on_import_reference)
+        tb.addAction(self._act_import_reference)
+
+        self._act_reference_match = QAction("参考库匹配", self)
+        self._act_reference_match.setToolTip(
+            "将未归类人脸与参考库进行相似度匹配\n"
+            "匹配成功则标记人物，未匹配则标记为「未知」"
+        )
+        self._act_reference_match.triggered.connect(self._on_reference_match)
+        tb.addAction(self._act_reference_match)
+
+        tb.addSeparator()
+
         self._act_clear = QAction("清空数据", self)
         self._act_clear.triggered.connect(self._on_clear_all)
         tb.addAction(self._act_clear)
@@ -351,6 +371,26 @@ class MainWindow(QMainWindow):
         self._blur_value_label.setStyleSheet("padding: 0 4px;")
         tb.addWidget(self._blur_value_label)
         self._blur_slider.valueChanged.connect(self._on_blur_slider_changed)
+
+        tb.addSeparator()
+
+        # 参考库匹配阈值
+        ref_label = QLabel("参考库阈值:")
+        ref_label.setStyleSheet("padding: 0 4px;")
+        tb.addWidget(ref_label)
+        self._ref_thresh_slider = QSlider(Qt.Orientation.Horizontal)
+        self._ref_thresh_slider.setRange(50, 85)
+        self._ref_thresh_slider.setValue(60)
+        self._ref_thresh_slider.setFixedWidth(100)
+        self._ref_thresh_slider.setToolTip("参考库匹配的余弦相似度阈值，高于此值则标记为该人物")
+        tb.addWidget(self._ref_thresh_slider)
+        self._ref_thresh_value_label = QLabel("0.60")
+        self._ref_thresh_value_label.setFixedWidth(36)
+        self._ref_thresh_value_label.setStyleSheet("padding: 0 4px;")
+        tb.addWidget(self._ref_thresh_value_label)
+        self._ref_thresh_slider.valueChanged.connect(
+            lambda v: self._ref_thresh_value_label.setText(f"{v / 100:.2f}")
+        )
 
     def _build_ui(self):
         central = QWidget()
@@ -778,6 +818,106 @@ class MainWindow(QMainWindow):
         if self._current_image_id is not None:
             self._show_image(self._current_image_id)
 
+    # ---- 参考库导入与匹配 ----
+
+    def _on_import_reference(self):
+        """导入已标记数据集：选择根目录，遍历人物子文件夹，多图特征综合写入 labeled_persons"""
+        folder = QFileDialog.getExistingDirectory(self, "选择参考库根目录")
+        if not folder:
+            return
+        items = list(load_labeled_dataset(folder))
+        if not items:
+            QMessageBox.warning(
+                self, "导入参考库",
+                "该目录下没有有效的人物子文件夹，或子文件夹内无支持的图片格式。\n"
+                "格式要求：根目录/人物编号(文件夹名)/大头照图片"
+            )
+            return
+
+        self.logger.info(f"导入参考库: 选择根目录 {folder}，共 {len(items)} 个人物")
+        self._statusbar.showMessage("正在导入参考库...")
+        self._set_actions_enabled(False)
+
+        self._ref_progress = QProgressDialog(
+            f"正在导入参考库（共 {len(items)} 人）...", "取消", 0, len(items), self
+        )
+        self._ref_progress.setWindowTitle("导入参考库")
+        self._ref_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._ref_progress.setMinimumDuration(0)
+        self._ref_progress.setValue(0)
+
+        worker = LabeledImportWorker(self.engine, self.db, folder)
+        worker.progress.connect(self._on_ref_import_progress)
+        worker.finished_all.connect(self._on_ref_import_done)
+        worker.error.connect(lambda msg: self.logger.warning(f"参考库导入: {msg}"))
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        self._ref_progress.canceled.connect(worker.cancel)
+        worker.start()
+
+    def _on_ref_import_progress(self, current: int, total: int, person_id: str):
+        self._ref_progress.setLabelText(f"导入 [{current}/{total}]: {person_id}")
+        self._ref_progress.setValue(current)
+
+    def _on_ref_import_done(self, imported_count: int):
+        self._ref_progress.close()
+        self._set_actions_enabled(True)
+        self._statusbar.showMessage(f"参考库导入完成: 成功 {imported_count} 人")
+        self.logger.info(f"参考库导入完成: {imported_count} 人")
+
+    def _on_reference_match(self):
+        """将未归类人脸与参考库相似度匹配，匹配则标记人物，未匹配则标记未知"""
+        ref_count = len(self.db.get_labeled_persons_with_features())
+        if ref_count == 0:
+            QMessageBox.information(
+                self, "参考库匹配",
+                "参考库为空，请先点击「导入参考库」选择已标记数据集根目录。"
+            )
+            return
+        face_count = len(self.db.get_unassigned_faces_with_features())
+        if face_count == 0:
+            QMessageBox.information(
+                self, "参考库匹配",
+                "没有待匹配的未归类人脸。\n请先完成「开始识别」后再执行参考库匹配。"
+            )
+            return
+
+        threshold = self._ref_thresh_slider.value() / 100.0
+        self.logger.info(f"参考库匹配: 阈值={threshold:.2f}，参考库 {ref_count} 人，待匹配 {face_count} 张")
+        self._statusbar.showMessage("正在参考库匹配...")
+        self._set_actions_enabled(False)
+
+        self._match_progress = QProgressDialog(
+            f"正在匹配 {face_count} 张人脸与参考库（阈值 {threshold:.2f}）...",
+            None, 0, 1, self
+        )
+        self._match_progress.setWindowTitle("参考库匹配")
+        self._match_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._match_progress.setMinimumDuration(0)
+
+        worker = ReferenceMatchWorker(self.db, cosine_threshold=threshold)
+        worker.progress.connect(self._on_ref_match_progress)
+        worker.finished_match.connect(self._on_ref_match_done)
+        worker.error.connect(lambda msg: self.logger.warning(f"参考库匹配: {msg}"))
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_ref_match_progress(self, current: int, total: int, text: str):
+        self._match_progress.setMaximum(max(total, 1))
+        self._match_progress.setValue(current)
+        self._match_progress.setLabelText(text)
+
+    def _on_ref_match_done(self, result: dict):
+        self._match_progress.close()
+        self._set_actions_enabled(True)
+        matched = result.get("matched", 0)
+        unknown = result.get("unknown", 0)
+        self._statusbar.showMessage(f"参考库匹配完成: 匹配 {matched} 张，未知 {unknown} 张")
+        self._person_panel.refresh()
+        if self._current_image_id is not None:
+            self._show_image(self._current_image_id)
+
     # ---- 清空/设置 ----
 
     def _on_clear_all(self):
@@ -837,5 +977,7 @@ class MainWindow(QMainWindow):
         self._act_detect.setEnabled(enabled)
         self._act_redetect.setEnabled(enabled)
         self._act_cluster.setEnabled(enabled)
+        self._act_import_reference.setEnabled(enabled)
+        self._act_reference_match.setEnabled(enabled)
         self._act_clear.setEnabled(enabled)
         self._act_switch_db.setEnabled(enabled)
