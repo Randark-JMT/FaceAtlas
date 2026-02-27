@@ -121,12 +121,13 @@ class PgConnectDialog(QDialog):
         )
 
     def _load_from_config(self):
+        """从配置加载表单，不自动连接数据库，避免启动卡顿（远程/无本地库时）。"""
         self._host_edit.setText(self.config.pg_host)
         self._port_edit.setText(str(self.config.pg_port))
         self._user_edit.setText(self.config.pg_user)
         self._pass_edit.setText(self.config.pg_password)
         self._db_combo.setCurrentText(self.config.pg_database)
-        self._refresh_databases()
+        # 不自动调用 _refresh_databases()，需用户手动点击「刷新数据库列表」
 
     def _set_status(self, text: str, ok: bool):
         self._status.setVisible(True)
