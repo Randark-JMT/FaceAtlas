@@ -248,13 +248,20 @@ class PersonGroup(QFrame):
             self.thumb_flow.addWidget(thumb)
             self._thumb_widgets[face_id] = thumb
 
-        # +N 标签
+        # +N 标签（有剩余时）或 收起 标签（已全部展开时，保留右键菜单入口）
         overflow = self._total_face_count - self._shown_count
         if overflow > 0:
             more_label = ClickableMoreLabel(f"+{overflow}")
             more_label.double_clicked.connect(self._on_show_more)
             more_label.context_menu_requested.connect(self._on_more_context_menu)
             self.thumb_flow.addWidget(more_label)
+        elif self._shown_count > MAX_THUMBS_PER_GROUP:
+            # 已全部展开，仍显示「收」框以便右键恢复默认
+            collapse_label = ClickableMoreLabel("收")
+            collapse_label.setToolTip("双击收起 | 右键：恢复默认 / 一次性显示全部")
+            collapse_label.double_clicked.connect(self._on_reset_default)
+            collapse_label.context_menu_requested.connect(self._on_more_context_menu)
+            self.thumb_flow.addWidget(collapse_label)
 
     @staticmethod
     def _load_thumb_sync(thumb: ClickableThumb, row):
