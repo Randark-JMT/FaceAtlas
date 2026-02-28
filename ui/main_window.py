@@ -407,10 +407,16 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(4, 4, 4, 4)
 
-        # 上半部分：图像查看器
+        # 上半部分：图像查看器（滚轮缩放、拖拽平移、双击恢复，两栏同步）
         top_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._original_viewer = ImageViewer("原始图像")
         self._result_viewer = ImageViewer("识别结果")
+        self._original_viewer.transform_changed.connect(
+            lambda z, x, y: self._result_viewer.set_transform(z, x, y)
+        )
+        self._result_viewer.transform_changed.connect(
+            lambda z, x, y: self._original_viewer.set_transform(z, x, y)
+        )
         top_splitter.addWidget(self._original_viewer)
         top_splitter.addWidget(self._result_viewer)
         top_splitter.setStretchFactor(0, 1)
