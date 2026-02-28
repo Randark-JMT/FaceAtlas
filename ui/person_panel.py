@@ -12,7 +12,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QFrame, QLineEdit, QPushButton, QComboBox,
-    QLayout, QSizePolicy,
+    QLayout, QSizePolicy, QMenu,
 )
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt, Signal, QRect, QSize, QPoint, QTimer
@@ -122,9 +122,10 @@ class ClickableThumb(QLabel):
 
 
 class ClickableMoreLabel(QLabel):
-    """可双击的 "+N" 展开标签"""
+    """可双击的 "+N" 展开标签：双击逐步显示，右键菜单提供恢复默认/一次性显示"""
 
     double_clicked = Signal()
+    context_menu_requested = Signal(QPoint)
 
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
@@ -134,10 +135,13 @@ class ClickableMoreLabel(QLabel):
             "border: 1px solid #555; color: #4a9eff; font-size: 11pt; font-weight: bold;"
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("双击加载更多（每次10张）")
+        self.setToolTip("双击逐步显示更多 | 右键：恢复默认 / 一次性显示全部")
 
     def mouseDoubleClickEvent(self, event):
         self.double_clicked.emit()
+
+    def contextMenuEvent(self, event):
+        self.context_menu_requested.emit(event.globalPos())
 
 
 # ---- 单个人物分组 ----
@@ -147,6 +151,7 @@ class PersonGroup(QFrame):
 
     name_changed = Signal(int, str)   # person_id, new_name
     face_double_clicked = Signal(int) # image_id
+    need_more_faces = Signal(int, int)  # person_id, min_count（需保证 face_rows 至少有这么多条）
 
     def __init__(self, person_id: int, name: str, face_rows: list,
                  total_face_count: int, thumb_cache: ThumbCache | None = None,
@@ -248,6 +253,7 @@ class PersonGroup(QFrame):
         if overflow > 0:
             more_label = ClickableMoreLabel(f"+{overflow}")
             more_label.double_clicked.connect(self._on_show_more)
+            more_label.context_menu_requested.connect(self._on_more_context_menu)
             self.thumb_flow.addWidget(more_label)
 
     @staticmethod
@@ -280,17 +286,41 @@ class PersonGroup(QFrame):
             requests.append((face_id, row["file_path"], bbox))
         return requests
 
-    def _on_show_more(self):
-        """双击 +号，展开更多人脸（需要从 DB 补充数据）"""
-        old_count = self._shown_count
-        self._shown_count = min(self._shown_count + 10, self._total_face_count)
-        # 如果当前 face_rows 不够，需要外部补充
-        if self._shown_count > len(self.face_rows):
-            # 信号通知外部补充数据（PersonPanel 处理）
-            pass
+    def append_face_rows(self, rows: list):
+        """外部补充人脸数据（PersonPanel 从 DB 拉取后调用）"""
+        self.face_rows.extend(rows)
         self._build_thumbs()
-        # 触发异步加载新增的缩略图
         self._request_async_load()
+
+    def _on_show_more(self):
+        """双击 +号：逐步显示下一张（每次 +10）"""
+        self._shown_count = min(self._shown_count + 10, self._total_face_count)
+        if self._shown_count > len(self.face_rows):
+            self.need_more_faces.emit(self.person_id, self._shown_count)
+        else:
+            self._build_thumbs()
+            self._request_async_load()
+
+    def _on_reset_default(self):
+        """恢复默认状态：只显示初始数量"""
+        self._shown_count = min(MAX_THUMBS_PER_GROUP, self._total_face_count)
+        self._build_thumbs()
+
+    def _on_show_all_remaining(self):
+        """一次性显示剩下的所有图片"""
+        self._shown_count = self._total_face_count
+        if self._shown_count > len(self.face_rows):
+            self.need_more_faces.emit(self.person_id, self._shown_count)
+        else:
+            self._build_thumbs()
+            self._request_async_load()
+
+    def _on_more_context_menu(self, global_pos: QPoint):
+        """+N 标签右键菜单：恢复默认 / 一次性显示剩余"""
+        menu = QMenu(self)
+        menu.addAction("恢复默认状态", self._on_reset_default)
+        menu.addAction("一次性显示剩下的图片", self._on_show_all_remaining)
+        menu.exec(global_pos)
 
     def _request_async_load(self):
         """请求异步加载未缓存的缩略图（由 PersonPanel 协调）"""
@@ -468,6 +498,7 @@ class PersonPanel(QWidget):
             )
             group.name_changed.connect(self._on_name_changed)
             group.face_double_clicked.connect(self.navigate_to_image)
+            group.need_more_faces.connect(self._on_need_more_faces)
             self._container_layout.addWidget(group)
             self._person_groups.append(group)
 
@@ -532,6 +563,19 @@ class PersonPanel(QWidget):
         requests = group.get_uncached_requests()
         if requests and self._thumb_cache:
             self._start_thumb_worker(requests)
+
+    def _on_need_more_faces(self, person_id: int, min_count: int):
+        """PersonGroup 需要更多人脸数据时，从 DB 拉取并补充"""
+        group = next((g for g in self._person_groups if g.person_id == person_id), None)
+        if group is None:
+            return
+        current_len = len(group.face_rows)
+        if min_count <= current_len:
+            return
+        all_rows = self.db.get_faces_by_person(person_id, limit=min_count)
+        new_rows = all_rows[current_len:]
+        if new_rows:
+            group.append_face_rows(new_rows)
 
     # ---- 排序与事件 ----
 
