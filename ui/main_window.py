@@ -365,7 +365,7 @@ class MainWindow(QMainWindow):
         sb.addWidget(blur_label)
         self._blur_slider = QSlider(Qt.Orientation.Horizontal)
         self._blur_slider.setRange(0, 100)
-        self._blur_slider.setValue(0)
+        self._blur_slider.setValue(50)
         self._blur_slider.setFixedWidth(120)
         self._blur_slider.setToolTip(
             "人脸清晰度过滤阈值（多指标融合评分 0-100）\n"
@@ -375,7 +375,7 @@ class MainWindow(QMainWindow):
             "算法：Laplacian + Tenengrad(Sobel) + FFT高频占比 加权融合"
         )
         sb.addWidget(self._blur_slider)
-        self._blur_value_label = QLabel("关闭")
+        self._blur_value_label = QLabel("50")
         self._blur_value_label.setFixedWidth(36)
         self._blur_value_label.setStyleSheet("padding: 0 4px;")
         sb.addWidget(self._blur_value_label)
