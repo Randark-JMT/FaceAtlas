@@ -59,11 +59,13 @@ class DetectWorker(QThread):
                  image_items: list[tuple[int, str]],
                  thumb_cache: ThumbCache | None = None,
                  num_workers: int | None = None,
-                 blur_threshold: float = 0.0):
+                 blur_threshold: float = 0.0,
+                 detect_conf_threshold: float = 1.0):
         """
         Args:
             image_items: [(image_id, file_path), ...] 待检测的图片列表
             blur_threshold: 模糊度阈值，低于此值的人脸将被丢弃。0 表示不过滤。
+            detect_conf_threshold: 人脸检测置信度阈值，低于此值的检测结果将被忽略。1.0 表示仅保留最高置信度。
         """
         super().__init__()
         self.logger = get_logger()
@@ -72,6 +74,7 @@ class DetectWorker(QThread):
         self.image_items = image_items
         self.thumb_cache = thumb_cache
         self.blur_threshold = blur_threshold
+        self.detect_conf_threshold = detect_conf_threshold
         if num_workers is None:
             if engine.backend_name == "CUDA":
                 # 多线程向 GPU 提交任务，提高利用率（单线程时 GPU 常处于等待状态）
@@ -80,7 +83,7 @@ class DetectWorker(QThread):
                 self.num_workers = max(os.cpu_count() or 4, 4)
         else:
             self.num_workers = num_workers
-        self.logger.info(f"DetectWorker: {len(image_items)} 张待检测，线程数: {self.num_workers}，模糊阈值: {self.blur_threshold}")
+        self.logger.info(f"DetectWorker: {len(image_items)} 张待检测，线程数: {self.num_workers}，检测阈值: {self.detect_conf_threshold:.2f}，模糊阈值: {self.blur_threshold}")
 
     def _process_one(self, engine: FaceEngine, fpath: str):
         """在 worker 线程中处理单张图片，返回轻量结果（不含完整图像）"""
@@ -90,6 +93,11 @@ class DetectWorker(QThread):
 
         h, w = image.shape[:2]
         faces = engine.detect(image)
+
+        # 人脸检测置信度过滤：低于阈值的检测结果忽略（浮点容差 1e-6，避免 0.9999 被 1.0 阈值误判）
+        if self.detect_conf_threshold > 0:
+            eps = 1e-6
+            faces = [f for f in faces if f.score >= self.detect_conf_threshold - eps]
 
         # ★ 模糊度检测：在特征提取之前过滤，节省计算量
         if self.blur_threshold > 0:
@@ -339,6 +347,30 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # 人脸检测置信度阈值（放在聚类阈值前面）
+        detect_label = QLabel("人脸检测阈值:")
+        detect_label.setStyleSheet("padding: 0 4px;")
+        sb.addWidget(detect_label)
+        self._detect_conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self._detect_conf_slider.setRange(50, 100)
+        self._detect_conf_slider.setValue(98)  # 默认 0.98
+        self._detect_conf_slider.setFixedWidth(120)
+        self._detect_conf_slider.setToolTip(
+            "人脸检测置信度阈值（MTCNN 输出 0-1）\n"
+            "低于此值的检测结果将被忽略，不参与识别与聚类\n"
+            "1.00 = 仅保留最高置信度；可调低以包含更多检测结果"
+        )
+        sb.addWidget(self._detect_conf_slider)
+        self._detect_conf_value_label = QLabel("0.98")
+        self._detect_conf_value_label.setFixedWidth(36)
+        self._detect_conf_value_label.setStyleSheet("padding: 0 4px;")
+        sb.addWidget(self._detect_conf_value_label)
+        self._detect_conf_slider.valueChanged.connect(
+            lambda v: self._detect_conf_value_label.setText(f"{v / 100:.2f}")
+        )
+
+        sb.addSeparator()
+
         # 聚类阈值滑块
         thresh_label = QLabel("聚类阈值:")
         thresh_label.setStyleSheet("padding: 0 4px;")
@@ -357,7 +389,7 @@ class MainWindow(QMainWindow):
             lambda v: self._thresh_value_label.setText(f"{v / 100:.2f}")
         )
 
-        tb.addSeparator()
+        sb.addSeparator()
 
         # 模糊度阈值滑块
         blur_label = QLabel("清晰度阈值:")
@@ -365,7 +397,7 @@ class MainWindow(QMainWindow):
         sb.addWidget(blur_label)
         self._blur_slider = QSlider(Qt.Orientation.Horizontal)
         self._blur_slider.setRange(0, 100)
-        self._blur_slider.setValue(50)
+        self._blur_slider.setValue(30)
         self._blur_slider.setFixedWidth(120)
         self._blur_slider.setToolTip(
             "人脸清晰度过滤阈值（多指标融合评分 0-100）\n"
@@ -375,13 +407,13 @@ class MainWindow(QMainWindow):
             "算法：Laplacian + Tenengrad(Sobel) + FFT高频占比 加权融合"
         )
         sb.addWidget(self._blur_slider)
-        self._blur_value_label = QLabel("50")
+        self._blur_value_label = QLabel("30")
         self._blur_value_label.setFixedWidth(36)
         self._blur_value_label.setStyleSheet("padding: 0 4px;")
         sb.addWidget(self._blur_value_label)
         self._blur_slider.valueChanged.connect(self._on_blur_slider_changed)
 
-        tb.addSeparator()
+        sb.addSeparator()
 
         # 参考库匹配阈值
         ref_label = QLabel("参考库阈值:")
@@ -680,10 +712,12 @@ class MainWindow(QMainWindow):
         items = [(row["id"], row["file_path"]) for row in unanalyzed]
 
         blur_threshold = self._blur_slider.value()
+        detect_conf_threshold = self._detect_conf_slider.value() / 100.0
         worker = DetectWorker(
             self.engine, self.db, items,
             thumb_cache=self._thumb_cache,
             blur_threshold=float(blur_threshold),
+            detect_conf_threshold=detect_conf_threshold,
         )
         worker.progress.connect(self._on_detect_progress)
         worker.finished_all.connect(self._on_detect_done)
@@ -736,6 +770,12 @@ class MainWindow(QMainWindow):
         # 人脸检测
         h, w = cv_img.shape[:2]
         faces = self.engine.detect(cv_img)
+
+        # 人脸检测置信度过滤（浮点容差 1e-6，避免 0.9999 被 1.0 阈值误判）
+        detect_conf_threshold = self._detect_conf_slider.value() / 100.0
+        if detect_conf_threshold > 0:
+            eps = 1e-6
+            faces = [f for f in faces if f.score >= detect_conf_threshold - eps]
 
         # 模糊度检测与过滤
         blur_threshold = self._blur_slider.value()
