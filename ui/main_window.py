@@ -25,7 +25,7 @@ from ui import APP_NAME, APP_VERSION
 from core.config import Config
 from core.logger import get_logger, log_opencv_error
 from core.database import DatabaseManager
-from core.face_engine import FaceEngine, FaceData, imread_unicode
+from core.face_engine import FaceEngine, FaceData, imread_unicode, get_cuda_recommended_workers
 from core.face_cluster import FaceCluster
 from core.labeled_import import LabeledImportWorker, load_labeled_dataset
 from core.reference_match import ReferenceMatchWorker
@@ -77,8 +77,8 @@ class DetectWorker(QThread):
         self.detect_conf_threshold = detect_conf_threshold
         if num_workers is None:
             if engine.backend_name == "CUDA":
-                # 多线程向 GPU 提交任务，提高利用率（单线程时 GPU 常处于等待状态）
-                self.num_workers = min(os.cpu_count() or 4, 6)
+                # 基于 GPU SM 数量动态决定 worker 数，榨干高性能卡算力
+                self.num_workers = get_cuda_recommended_workers()
             else:
                 self.num_workers = max(os.cpu_count() or 4, 4)
         else:

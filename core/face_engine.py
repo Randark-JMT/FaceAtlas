@@ -98,6 +98,22 @@ def _get_device(device: Optional[torch.device] = None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def get_cuda_recommended_workers() -> int:
+    """基于 GPU SM（Streaming Multiprocessor）数量推荐 CUDA 模式下的 worker 数。
+    用于提高 GPU 利用率，高性能卡可获得更多并发。
+    """
+    if not torch.cuda.is_available():
+        return 4
+    try:
+        props = torch.cuda.get_device_properties(0)
+        # multi_processor_count 为 SM 数量，与算力成正比
+        sm_count = props.multi_processor_count
+        workers = sm_count // 2
+        return workers
+    except Exception:
+        return 6
+
+
 # 关键点颜色 (BGR)
 LANDMARK_COLORS = [
     (255, 0, 0),    # 右眼
@@ -302,9 +318,44 @@ class FaceEngine:
             return np.zeros(FEATURE_DIM, dtype=np.float32)
 
     def extract_features(self, image: np.ndarray, faces: list[FaceData]) -> list[FaceData]:
-        """批量提取人脸特征"""
-        for face in faces:
-            self.extract_feature(image, face)
+        """批量提取人脸特征（批推理，提高 GPU 利用率）"""
+        if not faces:
+            return faces
+        if image is None or image.size == 0 or len(image.shape) < 2:
+            for f in faces:
+                f.feature = None
+            return faces
+
+        tensors: list[torch.Tensor] = []
+        valid_indices: list[int] = []
+        for i, face in enumerate(faces):
+            t = self._crop_face_for_resnet(image, face)
+            if t is not None:
+                tensors.append(t)
+                valid_indices.append(i)
+
+        # 全部裁剪失败
+        for f in faces:
+            f.feature = None
+        if not tensors:
+            return faces
+
+        try:
+            batch = torch.cat(tensors, dim=0)
+            with torch.no_grad():
+                embeddings = self.resnet(batch)
+            feats_np = embeddings.cpu().numpy().astype(np.float32)
+
+            for k, idx in enumerate(valid_indices):
+                feat = feats_np[k]
+                norm = np.linalg.norm(feat)
+                if norm > 0:
+                    feat = feat / norm
+                faces[idx].feature = feat
+        except Exception as e:
+            self.logger.warning("FaceEngine.extract_features: %s", e, exc_info=True)
+            for f in faces:
+                f.feature = None
         return faces
 
     def compare(self, feat1: np.ndarray, feat2: np.ndarray) -> float:
