@@ -586,6 +586,24 @@ class DatabaseManager:
     def get_all_faces_with_features(self) -> list:
         return self._execute_fetchall("SELECT * FROM faces WHERE feature IS NOT NULL")
 
+    def iter_all_faces_with_features(self, chunk_size: int = 10000):
+        """分批迭代所有人脸（含 feature），用于全量聚类时降低内存峰值。"""
+        offset = 0
+        while True:
+            rows = self._execute_fetchall(
+                """
+                SELECT * FROM faces WHERE feature IS NOT NULL ORDER BY id
+                LIMIT %s OFFSET %s
+                """,
+                (chunk_size, offset),
+            )
+            if not rows:
+                break
+            yield rows
+            if len(rows) < chunk_size:
+                break
+            offset += chunk_size
+
     def update_face_person(self, face_id: int, person_id: Optional[int]):
         self._execute("UPDATE faces SET person_id = %s WHERE id = %s", (person_id, face_id))
         self._maybe_commit()
@@ -861,6 +879,59 @@ class DatabaseManager:
         return self._execute_fetchall(
             "SELECT * FROM labeled_persons WHERE feature IS NOT NULL ORDER BY id"
         )
+
+    def get_labeled_person_count(self) -> int:
+        """返回参考库中有效人物数量（仅 COUNT，不加载数据）。"""
+        row = self._execute_fetchone(
+            "SELECT COUNT(*) AS cnt FROM labeled_persons WHERE feature IS NOT NULL"
+        )
+        return int(row["cnt"]) if row else 0
+
+    def iter_unassigned_faces_with_features(self, chunk_size: int = 10000):
+        """
+        分批迭代未分配人脸（含 feature），用于百万级数据时避免一次性加载。
+        Yields: list[dict] 每批最多 chunk_size 条
+        """
+        offset = 0
+        while True:
+            rows = self._execute_fetchall(
+                """
+                SELECT * FROM faces
+                WHERE feature IS NOT NULL AND person_id IS NULL
+                ORDER BY id
+                LIMIT %s OFFSET %s
+                """,
+                (chunk_size, offset),
+            )
+            if not rows:
+                break
+            yield rows
+            if len(rows) < chunk_size:
+                break
+            offset += chunk_size
+
+    def iter_labeled_persons_with_features(self, chunk_size: int = 5000):
+        """
+        分批迭代参考库人物（含 feature），用于参考库超大时降低内存。
+        Yields: list[dict] 每批最多 chunk_size 条
+        """
+        offset = 0
+        while True:
+            rows = self._execute_fetchall(
+                """
+                SELECT * FROM labeled_persons
+                WHERE feature IS NOT NULL
+                ORDER BY id
+                LIMIT %s OFFSET %s
+                """,
+                (chunk_size, offset),
+            )
+            if not rows:
+                break
+            yield rows
+            if len(rows) < chunk_size:
+                break
+            offset += chunk_size
 
     def get_labeled_person_ids(self) -> set[str]:
         """返回参考库中所有人物编号（用于人物归类面板的颜色区分）"""
