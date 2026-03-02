@@ -7,6 +7,9 @@ import numpy as np
 from core.database import DatabaseManager
 from core.logger import get_logger
 
+# 人脸分批大小，百万级时降低内存峰值
+FACE_CHUNK_SIZE = 10000
+
 
 class UnionFind:
     """并查集（路径压缩 + 按秩合并）"""
@@ -70,79 +73,81 @@ class FaceCluster:
             _report(0, 1, "清除未命名人物...")
             self.db.clear_all_persons(keep_named=True)
             
-            # 获取已有人物及其特征
+            # 获取已有人物及其特征（直接从 row 读取，避免逐条 get_person_feature）
             _report(0, 1, "加载已有人物特征...")
             existing_persons = self.db.get_persons_with_features()
             person_features: dict[int, np.ndarray] = {}
             for person in existing_persons:
-                feat = self.db.get_person_feature(person["id"])
-                if feat is not None:
-                    person_features[person["id"]] = feat.flatten()
+                if person.get("feature"):
+                    feat = DatabaseManager.feature_from_blob(person["feature"])
+                    if feat is not None:
+                        person_features[person["id"]] = feat.flatten()
             
-            # 只获取未分配的人脸
-            rows = self.db.get_unassigned_faces_with_features()
-            self.logger.info(f"增量模式：已有 {len(existing_persons)} 个人物，"
-                           f"{len(rows)} 张未分配人脸")
+            row_iter = self.db.iter_unassigned_faces_with_features(FACE_CHUNK_SIZE)
+            self.logger.info(f"增量模式：已有 {len(existing_persons)} 个人物，将分批匹配未分配人脸")
         else:
             # 全量模式：清除所有旧归类
             _report(0, 1, "清除旧归类数据...")
             self.db.clear_all_persons(keep_named=False)
-            rows = self.db.get_all_faces_with_features()
+            row_iter = None
             person_features = {}
 
-        if not rows and not person_features:
-            return {}
+        assigned_to_existing: dict[int, list[int]] = defaultdict(list)
+        unmatched_rows: list = []
 
-        # 先处理与已有人物的匹配（增量模式）
-        assigned_to_existing: dict[int, list[int]] = defaultdict(list)  # person_id -> [face_id]
-        unmatched_rows = []
+        if incremental and person_features:
+            # 分批加载 + 内存矩阵比对（避免 pgvector 百万次 DB 往返）
+            person_ids_list = list(person_features.keys())
+            person_feat_matrix = np.vstack([person_features[pid] for pid in person_ids_list])
+            person_feat_matrix = person_feat_matrix.astype(np.float32)
+            norms = np.linalg.norm(person_feat_matrix, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-10)
+            person_feat_matrix /= norms
 
-        if incremental and (person_features or (self.db._pgvector_available and existing_persons)):
-            _report(0, len(rows), "与已有人物匹配中...")
-            if self.db._pgvector_available:
-                # 使用 pgvector K-NN 加速
-                for i, row in enumerate(rows):
-                    if (i + 1) % 10 == 0:
-                        _report(i + 1, len(rows), f"匹配进度: {i + 1}/{len(rows)}")
+            processed = 0
+            matched_total = 0
+            for chunk in row_iter:
+                _report(processed, processed + len(chunk), f"与已有人物匹配: {processed + len(chunk)} 张...")
+                face_feat_list = []
+                for row in chunk:
                     feat = DatabaseManager.feature_from_blob(row["feature"])
-                    feat = feat.flatten().astype(np.float32)
-                    feat = feat / max(np.linalg.norm(feat), 1e-10)
-                    match = self.db.find_similar_person_for_face(feat, cosine_threshold)
-                    if match:
-                        person_id, _ = match
-                        assigned_to_existing[person_id].append(row["id"])
-                    else:
-                        unmatched_rows.append(row)
-            else:
-                # 回退：内存矩阵比对
-                person_ids_list = list(person_features.keys())
-                person_feat_matrix = np.vstack([person_features[pid] for pid in person_ids_list])
-                person_feat_matrix = person_feat_matrix.astype(np.float32)
-                norms = np.linalg.norm(person_feat_matrix, axis=1, keepdims=True)
-                norms = np.maximum(norms, 1e-10)
-                person_feat_matrix /= norms
+                    face_feat_list.append(feat.flatten().astype(np.float32))
+                face_feat_matrix = np.vstack(face_feat_list)
+                fnorms = np.linalg.norm(face_feat_matrix, axis=1, keepdims=True)
+                fnorms = np.maximum(fnorms, 1e-10)
+                face_feat_matrix /= fnorms
 
-                for i, row in enumerate(rows):
-                    if (i + 1) % 10 == 0:
-                        _report(i + 1, len(rows), f"匹配进度: {i + 1}/{len(rows)}")
-                    feat = DatabaseManager.feature_from_blob(row["feature"])
-                    feat = feat.flatten().astype(np.float32)
-                    feat = feat / max(np.linalg.norm(feat), 1e-10)
-                    similarities = person_feat_matrix @ feat
-                    max_sim = np.max(similarities)
+                similarities = person_feat_matrix @ face_feat_matrix.T
+                best_person_idx_per_face = np.argmax(similarities, axis=0)
+                max_sim_per_face = np.max(similarities, axis=0)
+
+                for i, row in enumerate(chunk):
+                    max_sim = float(max_sim_per_face[i])
                     if max_sim >= cosine_threshold:
-                        best_person_idx = np.argmax(similarities)
-                        best_person_id = person_ids_list[best_person_idx]
+                        best_person_id = person_ids_list[int(best_person_idx_per_face[i])]
                         assigned_to_existing[best_person_id].append(row["id"])
+                        matched_total += 1
                     else:
                         unmatched_rows.append(row)
+                processed += len(chunk)
+                del face_feat_matrix  # 及时释放块内存
 
             self.logger.info(
-                f"匹配完成：{len(rows) - len(unmatched_rows)} 张人脸匹配到已有人物，"
+                f"匹配完成：{matched_total} 张人脸匹配到已有人物，"
                 f"{len(unmatched_rows)} 张人脸需要新建归类"
             )
+        elif not incremental and row_iter is None:
+            # 全量模式：需要从 iter_all_faces 加载
+            for chunk in self.db.iter_all_faces_with_features(FACE_CHUNK_SIZE):
+                unmatched_rows.extend(chunk)
         else:
-            unmatched_rows = rows
+            # incremental 但 person_features 为空：无已有人物，全部入 unmatched
+            if row_iter is not None:
+                for chunk in row_iter:
+                    unmatched_rows.extend(chunk)
+
+        if not unmatched_rows and not assigned_to_existing:
+            return {}
 
         # 对未匹配的人脸进行聚类
         face_ids: list[int] = []
