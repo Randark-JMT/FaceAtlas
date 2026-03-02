@@ -922,7 +922,7 @@ class MainWindow(QMainWindow):
 
     def _on_reference_match(self):
         """将未归类人脸与参考库相似度匹配，匹配则标记人物，未匹配则标记未知"""
-        ref_count = len(self.db.get_labeled_persons_with_features())
+        ref_count = self.db.get_labeled_person_count()
         if ref_count == 0:
             QMessageBox.information(
                 self, "参考库匹配",
