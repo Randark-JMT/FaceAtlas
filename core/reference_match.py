@@ -60,7 +60,7 @@ class ReferenceMatchWorker(QThread):
         ref_matrix = ref_matrix / norms  # (n_ref, 512)
 
         unknown_person_id = self.db.get_or_create_unknown_person()
-        updates: list[tuple[int, int]] = []
+        updates: list[tuple[int, int, float]] = []
         matched = 0
         unknown_count = 0
         processed = 0
@@ -108,7 +108,7 @@ class ReferenceMatchWorker(QThread):
         self.progress.emit(processed, max(total_est, 1), "写入数据库...")
         if updates:
             self.db.batch_update_face_persons_with_ref_similarity(updates)
-            for person_id in set(p for p, _ in updates):
+            for person_id in set(p for p, _, _ in updates):
                 count = self.db.get_person_face_count(person_id)
                 self.db.update_person_face_count(person_id, count)
 
