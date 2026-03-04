@@ -125,7 +125,7 @@ class FaceCluster:
                     max_sim = float(max_sim_per_face[i])
                     if max_sim >= cosine_threshold:
                         best_person_id = person_ids_list[int(best_person_idx_per_face[i])]
-                        assigned_to_existing[best_person_id].append(row["id"])
+                        assigned_to_existing[best_person_id].append((row["id"], max_sim))
                         matched_total += 1
                     else:
                         unmatched_rows.append(row)
@@ -164,11 +164,12 @@ class FaceCluster:
             _report(1, 1, "正在更新数据库...")
             self.db.begin()
             try:
-                all_updates: list[tuple[int, int]] = []
+                all_updates: list[tuple[int, int, float]] = []
                 result: dict[int, list[int]] = {}
-                for person_id, fids in assigned_to_existing.items():
-                    for fid in fids:
-                        all_updates.append((person_id, fid))
+                for person_id, fid_sims in assigned_to_existing.items():
+                    fids = [fid for fid, _ in fid_sims]
+                    for fid, sim in fid_sims:
+                        all_updates.append((person_id, fid, sim))
                     result[person_id] = fids
 
                     # 用已有代表特征 + 新人脸特征计算平均值
@@ -261,22 +262,25 @@ class FaceCluster:
         result: dict[int, list[int]] = {}
         self.db.begin()
         try:
-            all_updates: list[tuple[int, int]] = []
+            all_updates: list[tuple[int, int, float]] = []
 
             # 处理新增的人物组（每组只需 1 次 INSERT + 2 次 UPDATE）
             for root_idx, group_face_ids in groups.items():
                 person_id = self.db.add_person()
                 self.db.update_person_face_count(person_id, len(group_face_ids))
                 self.db.update_person_feature(person_id, group_avg_feats[root_idx])
-
-                for fid in group_face_ids:
-                    all_updates.append((person_id, fid))
+                centroid = group_avg_feats[root_idx]
+                for k, fid in enumerate(group_face_ids):
+                    idx = group_indices[root_idx][k]
+                    sim = float(np.dot(feat_matrix[idx], centroid))
+                    all_updates.append((person_id, fid, sim))
                 result[person_id] = group_face_ids
 
             # 处理匹配到已有人物的人脸（增量模式时才有）
-            for person_id, fids in assigned_to_existing.items():
-                for fid in fids:
-                    all_updates.append((person_id, fid))
+            for person_id, fid_sims in assigned_to_existing.items():
+                fids = [fid for fid, _ in fid_sims]
+                for fid, sim in fid_sims:
+                    all_updates.append((person_id, fid, sim))
 
                 # 用已有特征 + 新人脸特征计算平均值
                 person_feats = []

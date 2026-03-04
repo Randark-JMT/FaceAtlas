@@ -286,6 +286,12 @@ class DatabaseManager:
         if ("faces", "blur_score") not in columns:
             self.logger.info("数据库迁移：添加 blur_score 列")
             self._execute("ALTER TABLE faces ADD COLUMN blur_score DOUBLE PRECISION DEFAULT 0")
+        if ("faces", "ref_match_similarity") not in columns:
+            self.logger.info("数据库迁移：添加 ref_match_similarity 列")
+            self._execute("ALTER TABLE faces ADD COLUMN ref_match_similarity DOUBLE PRECISION")
+        if ("faces", "cluster_similarity") not in columns:
+            self.logger.info("数据库迁移：添加 cluster_similarity 列")
+            self._execute("ALTER TABLE faces ADD COLUMN cluster_similarity DOUBLE PRECISION")
 
         # pgvector 迁移
         self._migrate_pgvector(columns)
@@ -618,8 +624,28 @@ class DatabaseManager:
         self._execute("UPDATE faces SET person_id = %s WHERE id = %s", (person_id, face_id))
         self._maybe_commit()
 
-    def batch_update_face_persons(self, updates: list[tuple[int, int]]):
-        self._executemany("UPDATE faces SET person_id = %s WHERE id = %s", updates)
+    def batch_update_face_persons(self, updates: list[tuple[int, int] | tuple[int, int, float]]):
+        """更新人脸归属。每项为 (person_id, face_id) 或 (person_id, face_id, cluster_similarity)。"""
+        if not updates:
+            return
+        first = updates[0]
+        if len(first) == 3:
+            self._executemany(
+                "UPDATE faces SET person_id = %s, cluster_similarity = %s WHERE id = %s",
+                [(p, s, f) for p, f, s in updates],
+            )
+        else:
+            self._executemany("UPDATE faces SET person_id = %s WHERE id = %s", updates)
+        self._maybe_commit()
+
+    def batch_update_face_persons_with_ref_similarity(self, updates: list[tuple[int, int, float]]):
+        """更新人脸归属及参考库匹配相似度。每项为 (person_id, face_id, ref_match_similarity)。"""
+        if not updates:
+            return
+        self._executemany(
+            "UPDATE faces SET person_id = %s, ref_match_similarity = %s WHERE id = %s",
+            [(p, s, f) for p, f, s in updates],
+        )
         self._maybe_commit()
 
     def delete_faces_by_image(self, image_id: int) -> list[int]:
@@ -988,7 +1014,7 @@ class DatabaseManager:
                         WHERE name IN ('未知', '未命名')
                            OR name IN (SELECT person_id FROM labeled_persons)
                     )
-                    UPDATE faces SET person_id = NULL
+                    UPDATE faces SET person_id = NULL, ref_match_similarity = NULL
                     WHERE person_id IN (SELECT id FROM matchable_person_ids)
                     """
                 )
@@ -1010,13 +1036,13 @@ class DatabaseManager:
         if keep_named:
             self._execute(
                 """
-                UPDATE faces SET person_id = NULL
+                UPDATE faces SET person_id = NULL, cluster_similarity = NULL, ref_match_similarity = NULL
                 WHERE person_id IN (SELECT id FROM persons WHERE name = '未命名')
                 """
             )
             self._execute("DELETE FROM persons WHERE name = '未命名'")
         else:
-            self._execute("UPDATE faces SET person_id = NULL")
+            self._execute("UPDATE faces SET person_id = NULL, cluster_similarity = NULL, ref_match_similarity = NULL")
             self._execute("DELETE FROM persons")
             self._execute("ALTER SEQUENCE persons_id_seq RESTART WITH 1")
         self._maybe_commit()

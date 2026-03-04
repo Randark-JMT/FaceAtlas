@@ -215,6 +215,23 @@ class PersonGroup(QFrame):
         # 初始创建占位缩略图
         self._build_thumbs()
 
+    def _face_thumb_tooltip(self, row: dict) -> str:
+        """根据人脸行数据生成缩略图悬停提示（含识别/相似度信息）。"""
+        parts = [f"来源: {row.get('filename', '')}", "双击跳转"]
+        score = row.get("score")
+        if score is not None:
+            parts.insert(1, f"检测置信度: {float(score):.0%}")
+        blur = row.get("blur_score")
+        if blur is not None and blur > 0:
+            parts.insert(2 if score is not None else 1, f"清晰度: {float(blur):.0%}")
+        ref_sim = row.get("ref_match_similarity")
+        if ref_sim is not None:
+            parts.insert(-1, f"参考库匹配相似度: {float(ref_sim):.0%}")
+        cluster_sim = row.get("cluster_similarity")
+        if cluster_sim is not None:
+            parts.insert(-1, f"聚类相似度: {float(cluster_sim):.0%}")
+        return " | ".join(parts)
+
     def _build_thumbs(self):
         """构建缩略图控件（仅创建占位符，实际图像由缓存/异步加载）"""
         # 清空
@@ -230,7 +247,7 @@ class PersonGroup(QFrame):
             thumb = ClickableThumb(row["image_id"], face_id)
             thumb.setFixedSize(56, 56)
             thumb.setStyleSheet("border: 1px solid #555; background: #333;")
-            thumb.setToolTip(f"双击跳转 | 来源: {row['filename']}")
+            thumb.setToolTip(self._face_thumb_tooltip(row))
 
             # 尝试从缓存加载
             if self._thumb_cache:

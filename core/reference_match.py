@@ -91,10 +91,10 @@ class ReferenceMatchWorker(QThread):
                     ref_label_id = ref_ids[ref_idx]
                     person_name = ref_names[ref_label_id]
                     person_id = self.db.get_or_create_person_by_name(person_name)
-                    updates.append((person_id, face_id))
+                    updates.append((person_id, face_id, sim_val))
                     matched += 1
                 else:
-                    updates.append((unknown_person_id, face_id))
+                    updates.append((unknown_person_id, face_id, sim_val))
                     unknown_count += 1
 
             processed += len(faces)
@@ -107,7 +107,7 @@ class ReferenceMatchWorker(QThread):
 
         self.progress.emit(processed, max(total_est, 1), "写入数据库...")
         if updates:
-            self.db.batch_update_face_persons(updates)
+            self.db.batch_update_face_persons_with_ref_similarity(updates)
             for person_id in set(p for p, _ in updates):
                 count = self.db.get_person_face_count(person_id)
                 self.db.update_person_face_count(person_id, count)
