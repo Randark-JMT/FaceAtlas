@@ -224,7 +224,7 @@ class PersonGroup(QFrame):
             parts.insert(1, f"检测置信度: {float(score):.0%}")
         blur = row.get("blur_score")
         if blur is not None and blur > 0:
-            parts.insert(2 if score is not None else 1, f"清晰度: {float(blur):.0%}")
+            parts.insert(2 if score is not None else 1, f"清晰度: {float(blur):.1f}")
         ref_sim = row.get("ref_match_similarity")
         if ref_sim is not None:
             parts.insert(-1, f"参考库匹配相似度: {float(ref_sim):.0%}")
