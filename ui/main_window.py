@@ -566,9 +566,14 @@ class MainWindow(QMainWindow):
     def _load_image_list(self):
         """从数据库加载图片列表（后台线程分页拉取，主线程按批追加，避免卡顿）"""
         self._image_list.clear()
-        if self._image_list_worker and self._image_list_worker.isRunning():
-            self._image_list_worker.quit()
-            self._image_list_worker.wait(300)
+        # 旧 worker 可能已因 deleteLater 被销毁，访问前需防御性检查
+        try:
+            if self._image_list_worker and self._image_list_worker.isRunning():
+                self._image_list_worker.quit()
+                self._image_list_worker.wait(300)
+        except RuntimeError:
+            # C++ 对象已删除（例如上一轮 worker 已 finish 并 deleteLater）
+            self._image_list_worker = None
 
         search_text = self._image_search_edit.text().strip() if hasattr(self, "_image_search_edit") else ""
         worker = LoadImageListWorker(self.db, search_text, IMAGE_LIST_PAGE_SIZE)
