@@ -5,6 +5,7 @@ import os
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -34,15 +35,19 @@ def _first_image_in_folder(folder_path: str) -> str | None:
     return None
 
 
-def _cv_to_pixmap(cv_img: np.ndarray, w: int, h: int) -> QPixmap:
+def _cv_to_pixmap(cv_img: np.ndarray, max_w: int | None = None, max_h: int | None = None) -> QPixmap:
+    """将 OpenCV 图像转为 QPixmap；若指定 max_w/max_h 则按比例缩放到该范围内。"""
     rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     ih, iw, ch = rgb.shape
     qimg = QImage(rgb.data, iw, ih, ch * iw, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg).scaled(
-        w, h,
-        Qt.AspectRatioMode.KeepAspectRatio,
-        Qt.TransformationMode.SmoothTransformation,
-    )
+    pix = QPixmap.fromImage(qimg)
+    if max_w is not None and max_h is not None:
+        pix = pix.scaled(
+            max_w, max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    return pix
 
 
 class ReferenceSearchDialog(QDialog):
@@ -52,6 +57,9 @@ class ReferenceSearchDialog(QDialog):
         super().__init__(parent)
         self.db = db
         self.face_id = face_id
+        self._query_pixmap: QPixmap | None = None  # 原始比例，用于随窗口缩放
+        self._ref_pixmaps: list[QPixmap] = []      # 每个参考图原始比例
+        self._ref_thumb_labels: list[QLabel] = []  # 参考图 QLabel，用于 resize 时重绘
         self.setWindowTitle("参考库检索 — 人脸 F{}".format(face_id))
         self.setMinimumSize(720, 520)
         self.setModal(False)
@@ -69,10 +77,11 @@ class ReferenceSearchDialog(QDialog):
         root.addWidget(self._query_label)
 
         self._query_thumb = QLabel()
-        self._query_thumb.setFixedSize(120, 120)
+        self._query_thumb.setMinimumSize(80, 80)
         self._query_thumb.setStyleSheet("border: 2px solid #b0a830; background: #2a2a2a;")
         self._query_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._query_thumb.setText("加载中…")
+        self._query_thumb.setScaledContents(False)
         root.addWidget(self._query_thumb)
 
         # 参考库相似度 Top 20
@@ -90,6 +99,51 @@ class ReferenceSearchDialog(QDialog):
         scroll.setWidget(self._ref_container)
         root.addWidget(scroll)
 
+    def _update_thumbnail_sizes(self):
+        """根据当前窗口尺寸按比例缩放并刷新所有缩略图（随窗口放大/缩小）。"""
+        # 使用对话框当前宽度计算，避免 resizeEvent 时子控件宽度尚未更新的问题
+        dialog_w = self.width()
+        if dialog_w <= 0:
+            return
+
+        # 选定人脸：随窗口宽度变化，约 1/4 宽，范围 80～320
+        if self._query_pixmap and not self._query_pixmap.isNull():
+            w = max(80, min(320, dialog_w // 4))
+            scaled = self._query_pixmap.scaled(
+                w, w,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._query_thumb.setFixedSize(w, w)
+            self._query_thumb.setPixmap(scaled)
+
+        # 参考库网格：按对话框可用宽度均分 5 列（留边距、滚动条等约 80px）
+        if not self._ref_pixmaps or not self._ref_thumb_labels:
+            return
+        content_w = max(0, dialog_w - 80)
+        # 5 列、4 个间隙 8px
+        cell_size = max(40, (content_w - 8 * 4) // 5)
+        for label, pix in zip(self._ref_thumb_labels, self._ref_pixmaps):
+            label.setFixedSize(cell_size, cell_size)
+            if pix.isNull():
+                continue
+            scaled = pix.scaled(
+                cell_size, cell_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_thumbnail_sizes()
+        # 布局可能滞后一帧，再刷新一次确保随窗口缩小也能正确更新
+        QTimer.singleShot(0, self._update_thumbnail_sizes)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._update_thumbnail_sizes)
+
     def _load_data(self):
         face_row = self.db.get_face_with_file_path(self.face_id)
         if not face_row:
@@ -103,8 +157,9 @@ class ReferenceSearchDialog(QDialog):
         if img is not None:
             bbox = (face_row["bbox_x"], face_row["bbox_y"], face_row["bbox_w"], face_row["bbox_h"])
             crop = FaceEngine.crop_face(img, bbox)
-            pix = _cv_to_pixmap(crop, 120, 120)
-            self._query_thumb.setPixmap(pix)
+            # 保存原比例 pixmap（限制最大边长便于放大观察）
+            self._query_pixmap = _cv_to_pixmap(crop, 400, 400)
+            self._update_thumbnail_sizes()
         else:
             self._query_thumb.setText("无法加载图片")
 
@@ -120,24 +175,26 @@ class ReferenceSearchDialog(QDialog):
             person_id = ref.get("person_id", "?")
             folder_path = ref.get("folder_path", "")
             thumb = QLabel()
-            thumb.setFixedSize(80, 80)
+            thumb.setMinimumSize(40, 40)
             thumb.setStyleSheet("border: 1px solid #555; background: #333;")
             thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pix = QPixmap()
             first_img = _first_image_in_folder(folder_path)
             if first_img:
                 img = imread_unicode(first_img)
                 if img is not None:
-                    # 简单居中裁剪为方形后缩放
                     h, w = img.shape[:2]
                     s = min(h, w)
                     y, x = (h - s) // 2, (w - s) // 2
                     crop = img[y:y + s, x:x + s]
-                    pix = _cv_to_pixmap(crop, 80, 80)
-                    thumb.setPixmap(pix)
+                    pix = _cv_to_pixmap(crop, 300, 300)
+                    # 首次显示由 _update_thumbnail_sizes 统一设置
                 else:
                     thumb.setText("?")
             else:
                 thumb.setText("—")
+            self._ref_pixmaps.append(pix)
+            self._ref_thumb_labels.append(thumb)
             sim_label = QLabel(f"{person_id}\n相似度: {sim:.2%}")
             sim_label.setStyleSheet("font-size: 9pt; color: #ccc;")
             sim_label.setWordWrap(True)
@@ -148,3 +205,4 @@ class ReferenceSearchDialog(QDialog):
             cell_layout.addWidget(thumb)
             cell_layout.addWidget(sim_label)
             self._ref_layout.addWidget(cell, row, col)
+        self._update_thumbnail_sizes()
