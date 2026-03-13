@@ -798,18 +798,20 @@ class DatabaseManager:
                 (fid,),
             )
 
-        # 纯数字：同时匹配人物ID、图片ID、人脸ID
+        # 纯数字：同时匹配人物ID、图片ID、人脸ID、以及人物姓名包含该数字（如 2026 匹配姓名 20260304-28）
         if search.isdigit():
             num = int(search)
+            name_pattern = f"%{search}%"
             rows = self._execute_fetchall(
                 """
                 SELECT DISTINCT p.* FROM persons p
                 WHERE p.id = %s
+                   OR p.name ILIKE %s
                    OR EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id AND f.image_id = %s)
                    OR EXISTS (SELECT 1 FROM faces f WHERE f.person_id = p.id AND f.id = %s)
                 ORDER BY p.id
                 """,
-                (num, num, num),
+                (num, name_pattern, num, num),
             )
             return rows
 
